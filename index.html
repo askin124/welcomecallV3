@@ -705,16 +705,76 @@ async function analyzeContract(b64, mime) {
     : {type:'document', source:{type:'base64', media_type:'application/pdf', data:b64}};
 
   const prompt = `Tu es un expert en analyse de dossiers de terminaux de paiement Worldline/Inocrea.
-Ce PDF peut contenir plusieurs documents : bon de commande Inocrea, contrat Worldline, carte d'identité recto/verso, RIB/relevé bancaire, annexes services.
+Ce PDF contient plusieurs documents dans un ordre variable : bon de commande Inocrea, contrat(s) Worldline, carte d'identité recto/verso, RIB/attestation bancaire, annexes services.
 Analyse l'ENSEMBLE des pages et retourne UNIQUEMENT un JSON valide sans markdown.
-
 Confiance : "high"=clairement lisible, "med"=partiellement lisible, "low"=illisible/absent.
 
-SECTION 1 — CONTRAT (bon de commande Inocrea, page 1)
-SECTION 2 — CARTE D'IDENTITÉ : cherche une CI belge recto (photo, nom, prénom, date naissance, validité) et verso (MRZ, numéro registre national). Evalue couleur vs N&B, qualité, validité.
-SECTION 3 — RIB : cherche un relevé bancaire ou attestation IBAN (ING, BNP, Belfius, KBC...). Vérifie que l'IBAN du RIB correspond à celui du contrat. Vérifie que le nom société du RIB correspond.
+═══ RÈGLE FONDAMENTALE — PAGES BARRÉES ═══
+Si une page est traversée par un trait diagonal allant d'un coin à l'autre (page annulée/barrée), ignore ABSOLUMENT TOUS ses champs sans exception.
+Une page barrée se reconnaît à un grand trait en diagonale traversant toute la page de coin à coin.
+Même si des cases sont cochées sur cette page (y compris DCC = "Ja", Backup = coché, chèques repas, etc.), ignore-les toutes.
+Sur une page barrée : tous les champs svc_* concernés = "nc", pas "oui".
+ATTENTION : Le champ DCC est souvent pré-coché "Ja" par défaut sur la page services néerlandaise. Si cette page est barrée → svc_dcc="nc" obligatoirement.
 
-JSON à retourner (NE PAS omettre les champs doc_*) :
+═══ RÈGLE — CHAMPS STRICTS ═══
+Ne déclare un champ comme "oui" que si la case est EXPLICITEMENT cochée ou le texte clairement présent.
+En cas de doute → "nc". Ne jamais inventer ou enrichir le contenu. Les notes_contrat = retranscription mot pour mot uniquement de ce qui est manuscrit dans la zone Notes, rien d'autre.
+
+═══ SECTION 1 — BON DE COMMANDE INOCREA ═══
+Page avec double logo Inocrea + Worldline en haut.
+- Extrais : societe, bce, adresse, email, tel, contact, peppol, iban, commercial, date_signature, civilite
+- modele : "RX5000" si ligne RX5000 cochée/montant renseigné, "DX8000" si ligne DX8000, "Yomani Double Module", "MarketPay PAX A8500 + Q25", "MarketPay PAX A8900", sinon "Inconnu"
+- connect : WiFi / 4G / Ethernet selon case cochée
+- nb : quantité dans la colonne Qté du bon Inocrea. Si la colonne Qté est vide alors que le terminal est sélectionné → nb=0 ET qte_manquante_inocrea=true
+- location_type : "Grenke" si Option 1 cochée, "Inocrea" si Option 2, "Achat" si Option 3
+- loyer_ttc, nbre_loyers (nombre de loyers trimestriels), duree_mois
+- CALCUL DURÉE : périodicité toujours trimestrielle. Si duree_mois vide mais nbre_loyers présent → duree_mois = nbre_loyers × 3 (confiance "med"). Si nbre_loyers vide mais duree_mois présent → nbre_loyers = duree_mois / 3 (confiance "med").
+- caisse : système de caisse manuscrit dans le champ ou dans les notes/commentaires
+- notes_contrat : texte manuscrit exact de la zone Notes uniquement
+
+═══ SECTION 2 — BON DE COMMANDE WORLDLINE ═══
+Pages avec entête Worldline uniquement (pas le bon Inocrea).
+- Pour chaque ligne de terminal ou kit cochée/sélectionnée (RX5000, DX8000, Kit Start, Kit Pro, câbles...) : vérifier si la colonne Qté contient un chiffre.
+- Si une ligne est cochée/sélectionnée ET que sa colonne Qté est vide ou nulle → qte_manquante_worldline=true
+- Si toutes les lignes cochées ont bien une quantité renseignée → qte_manquante_worldline=false
+- kit : "pro" si Kit Pro coché (4002401200), "start" si Kit Start coché (4002480950), "aucun" sinon
+- dx_ref : "C01602" ou "C01615" pour DX8000, "C01603" pour RX5000, sinon "autre" ou "aucun"
+
+═══ SECTION 6 — SERVICES ═══
+Analyse les pages "Cartes de paiement" et "Services à valeur ajoutée" (si elles ne sont PAS barrées).
+
+svc_cc = "oui" si la case "Activation Cartes Internationales : 10,00€" est cochée (petit ✓ dans le carré) sur la page Cartes de paiement, et que cette page n'est PAS barrée. Une seule case cochée suffit — pas besoin que Visa ou Mastercard soient également sélectionnés séparément.
+svc_cr = "oui" si les chèques-repas sont cochés (Edenred, Monizze, Pluxee, Sodexo...) sur une page non barrée.
+svc_dcc = "oui" UNIQUEMENT si la case DCC est cochée sur une page NON barrée. Si la page est barrée → "nc". Attention : DCC est souvent pré-coché "Ja" sur la page néerlandaise qui peut être barrée.
+svc_backup = "oui" UNIQUEMENT si la case Backup mode est cochée sur une page NON barrée.
+svc_ores = "oui" si ORES est coché.
+svc_barra = "oui" si Barracuda est coché.
+svc_eid = "oui" si lecteur carte d'identité est coché.
+svc_pad = "oui" si paiement à distance est coché.
+Pour tout service non mentionné ou sur page barrée → "nc".
+Obligatoire si modele = RX5000. Liste officielle des systèmes valides :
+3GO Software, 4Retail, ACA Fashion Software, AH Automation, Alfazet, Becosoft, Beniro Optix, Biesbroeck Automation, Bizarre/Horecakassa, Bizerba, Bolt MPlus, Carfac/WASP, Centric, Cerme ICT, Corilus BE, Corilus NL, Cowhills, Created Software CR8ED, CTAC, Datacon, Deligo Vision, Diebold Nixdorf, Diomedia, EasyPOS, Eatcard, EDDS Technology, Euresisoft, Flyx Cloud, Fujiton/K-Rent, Futurekassasystemen/Paysofort, Greenisland/Kate, Hanos, Heijne BV, Index Hospitality System, Ineo Mercator, Initeam, Insys, Intec Software, Intelart, JES, KassaNoord/KassaNuus, Leza BV, Marti Orbak, Nedfox, Neo Company, Officinall, Orkhon, Pharmony, QIOX, R2Retail Solutions/Hendrickx, Reconneqt/Anchr/AXI, Recreanet, Restomax, Retail4U/Eurosisoft, RetailDesk, Sanders Techniek/STN, Scanfie, SDP/Alistar, Simac, Slytio, SoftTouch, Software Support Nederland, Straight Systems, TCOG, Terminal Session, Tilroy, Toshiba, Twelve, Valk Solutions, Van Hessen, Vendit, Verdesoft, VetsWare, Vintia/Gantner, Winfakt BV, Xaris, Yina Solutions, Your POS, Zorgi.
+- Si le texte correspond exactement → caisse_statut="valide"
+- Si le texte ressemble à un nom de la liste (faute d'orthographe probable) → caisse_statut="reconfirmer" et caisse_suggestion="[nom officiel probable]"
+- Si totalement inconnu → caisse_statut="inconnu"
+- Si vide et modele=RX5000 → caisse_statut="manquant"
+
+═══ SECTION 4 — CARTE D'IDENTITÉ ═══
+RECTO = face avec PHOTO DE VISAGE + nom, prénom, date naissance, date validité, numéro carte. PAS de MRZ.
+VERSO = face SANS photo, avec numéro registre national, code-barres, MRZ (3 lignes de chiffres/lettres type IDBEL...). PAS de photo de visage.
+- doc_ci_recto = true UNIQUEMENT si photo de visage clairement visible
+- doc_ci_verso = true UNIQUEMENT si MRZ visible (lignes type IDBEL...) sans photo de visage
+- doc_ci_couleur = true si teinte verte/bleue caractéristique des CI belges, false si grise/photocopie N&B
+- doc_ci_valide = true si date "valide jusqu'au" postérieure à juin 2026
+- doc_ci_qualite = "high" si nette et lisible, "med" si acceptable, "low" si floue/illisible
+- doc_ci_nom : nom + prénom tel que lu sur le recto
+
+═══ SECTION 5 — RIB / ATTESTATION BANCAIRE ═══
+Page avec logo de banque belge (Belfius, ING, BNP Paribas Fortis, KBC, Bpost Bank, Nagelmackers, Crelan, Argenta, Triodos, Fintro...) et un IBAN professionnel.
+- doc_rib_iban_match = true si IBAN du RIB = IBAN du contrat (ignore espaces et tirets)
+- doc_rib_ok = true si banque identifiable + société visible + IBAN correspondant au contrat
+
+JSON à retourner :
 {
   "societe": {"v":"","c":"high"},
   "bce": {"v":"","c":"high"},
@@ -727,14 +787,19 @@ JSON à retourner (NE PAS omettre les champs doc_*) :
   "commercial": {"v":"","c":"high"},
   "date_signature": {"v":"","c":"high"},
   "civilite": {"v":"M.|Mme","c":"high"},
-  "modele": {"v":"RX5000|DX8000|Yomani Double Module|MarketPay PAX A8500|MarketPay PAX A8900|Inconnu","c":"high"},
+  "modele": {"v":"RX5000|DX8000|Yomani Double Module|MarketPay PAX A8500 + Q25|MarketPay PAX A8900|Inconnu","c":"high"},
   "connect": {"v":"WiFi|4G|Ethernet","c":"high"},
   "nb": {"v":1,"c":"high"},
+  "qte_manquante_inocrea": false,
+  "qte_manquante_worldline": false,
   "kit": {"v":"start|pro|aucun","c":"high"},
-  "dx_ref": {"v":"C01602|C01615|autre|aucun","c":"high"},
+  "dx_ref": {"v":"C01602|C01615|C01603|autre|aucun","c":"high"},
   "caisse": {"v":"","c":"high"},
+  "caisse_statut": "valide|reconfirmer|inconnu|manquant",
+  "caisse_suggestion": "",
   "location_type": {"v":"Grenke|Inocrea|Achat","c":"high"},
   "loyer_ttc": {"v":"","c":"high"},
+  "nbre_loyers": {"v":"","c":"high"},
   "duree_mois": {"v":"","c":"high"},
   "abonnement": {"v":"INO-Mobile Flex Sans engagement|INO-Mobile Flex Mensuelle|INO-Mobile Sub 2ans|INO-Mobile Sub 5ans|INO-Basic 2ans|INO-Basic 5ans|INO-Max 2ans|INO-Max 5ans|","c":"high"},
   "svc_cc": "oui|non|nc",
@@ -762,17 +827,7 @@ JSON à retourner (NE PAS omettre les champs doc_*) :
   "doc_ci_validite": "",
   "doc_ci_valide": false,
   "doc_ci_qualite": "low"
-}
-
-RÈGLES IMPORTANTES :
-- doc_rib_present = true si une page contient un relevé/attestation bancaire (ING, BNP, Belfius, KBC, Nagelmackers, etc.)
-- doc_rib_iban_match = true si l'IBAN du RIB correspond exactement à l'IBAN du contrat (ignore espaces)
-- doc_rib_ok = true si banque visible + société visible + IBAN correspondant
-- doc_ci_recto = true si une page montre le recto d'une carte d'identité belge (avec photo)
-- doc_ci_verso = true si une page montre le verso (avec MRZ / lignes de chiffres)
-- doc_ci_couleur = true si la CI est en couleur (pas N&B/photocopie grise)
-- doc_ci_valide = true si la date "valide jusqu'au" est dans le futur (après juin 2026)
-- doc_ci_qualite = "high" si nette et lisible, "med" si acceptable, "low" si floue/illisible`;
+}`;
 
   const resp = await fetch('https://quiet-bonus-454e.olivierdubost.workers.dev/', {
     method: 'POST',
@@ -827,8 +882,21 @@ function detectAnomalies(d) {
     }
     // DX8000 sans caisse = normal (imprime les tickets directement)
   }
-  if (d.modele?.v === "RX5000" && (!d.caisse?.v || d.caisse.v.trim() === "")) {
-    add("orange", "RX5000 : système de caisse non renseigné", "Le RX5000 n'imprime pas de ticket et nécessite généralement un système de caisse. À confirmer avec le client.");
+  if (d.modele?.v === "RX5000") {
+    const cs = d.caisse_statut;
+    if (cs === "manquant" || !d.caisse?.v || d.caisse.v.trim() === "") {
+      add("red", "RX5000 : système de caisse manquant", "Le RX5000 nécessite un système de caisse. À renseigner obligatoirement.");
+    } else if (cs === "reconfirmer") {
+      add("orange", "Système de caisse à reconfirmer", "\"" + (d.caisse?.v||"") + "\" ressemble à \"" + (d.caisse_suggestion||"?") + "\" — faute d'orthographe probable. À confirmer avec le client.");
+    } else if (cs === "inconnu") {
+      add("orange", "Système de caisse inconnu", "\"" + (d.caisse?.v||"") + "\" n'est pas dans la liste des intégrateurs Worldline. À vérifier.");
+    }
+  }
+  if (d.qte_manquante_inocrea === true || (d.nb && String(d.nb?.v) === '0')) {
+    add("red", "Quantité manquante (bon Inocrea)", "Le terminal est sélectionné mais la colonne Qté est vide sur le bon de commande Inocrea. Worldline peut refuser le dossier.");
+  }
+  if (d.qte_manquante_worldline === true) {
+    add("red", "Quantité manquante (bon Worldline)", "Le kit est sélectionné mais la colonne Qté est vide sur le bon de commande Worldline. Une quantité est obligatoire — Worldline refusera le dossier.");
   }
   if (!d.email?.v || d.email.v.trim() === "") {
     add("orange", "Email client manquant", "L'adresse email n'est pas renseignée.");
@@ -906,24 +974,66 @@ function renderAnalysis() {
     return '<span style="display:inline-block;background:'+bg+';color:'+col+';border:1px solid '+brd+';border-radius:4px;font-size:11px;font-weight:700;padding:1px 6px;margin-right:5px;vertical-align:middle">'+lbl+'</span>';
   };
 
+  const SELECT_OPTS = {
+    modele: ['RX5000','DX8000','Yomani Double Module','MarketPay PAX A8500 + Q25','MarketPay PAX A8900'],
+    connect: ['WiFi','4G','Ethernet'],
+    kit: ['start','pro','aucun'],
+    dx_ref: ['C01602','C01615','C01603','aucun'],
+    location_type: ['Grenke','Inocrea','Achat'],
+    civilite: ['M.','Mme'],
+    abonnement: ['INO-Mobile Flex Sans engagement','INO-Mobile Flex Mensuelle','INO-Mobile Sub 2ans','INO-Mobile Sub 5ans','INO-Basic 2ans','INO-Basic 5ans','INO-Max 2ans','INO-Max 5ans']
+  };
+
   const row = (label, key) => {
     const val = g(key);
     const empty = !val.trim();
+    const isSelect = !!SELECT_OPTS[key];
+    const dispId = 'disp_'+key;
+    const editRowId = 'erow_'+key;
+    const displayVal = empty ? 'Non renseigné' : (key==='loyer_ttc' ? val+' €' : val);
+    const displayColor = empty ? 'var(--red)' : 'var(--text)';
+
+    if (isSelect) {
+      const opts = SELECT_OPTS[key].map(o =>
+        '<option value="'+o+'"'+(o===val?' selected':'')+'>'+o+'</option>'
+      ).join('');
+      return '<tr style="border-bottom:1px solid var(--border)">' +
+        '<td style="padding:7px 10px;font-size:11px;font-weight:700;text-transform:uppercase;color:var(--muted);white-space:nowrap;width:32%">'+label+'</td>' +
+        '<td style="padding:7px 10px;font-size:13px;font-weight:600;color:'+displayColor+'">'+badge(key)+'<span id="'+dispId+'">'+displayVal+'</span></td>' +
+        '<td style="padding:7px 6px;width:24px;text-align:center"><span onclick="toggleEdit(this,\''+key+'\')" style="cursor:pointer;font-size:11px;color:var(--muted)">✎</span></td>' +
+        '</tr>' +
+        '<tr id="'+editRowId+'" style="display:none;background:var(--orange-lt)"><td colspan="3" style="padding:2px 10px 7px">' +
+        '<div style="display:flex;gap:6px;align-items:center">' +
+        '<select id="sel_'+key+'" style="flex:1;border:1.5px solid var(--orange);border-radius:5px;padding:5px 8px;font-size:12px;font-family:inherit;background:#fff;color:var(--text)">' +
+        opts + '</select>' +
+        '<button onclick="validateSelect(\''+key+'\')" style="background:var(--green);color:#fff;border:none;border-radius:5px;padding:5px 10px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit">✓</button>' +
+        '</div></td></tr>';
+    }
+
     return '<tr style="border-bottom:1px solid var(--border)">' +
       '<td style="padding:7px 10px;font-size:11px;font-weight:700;text-transform:uppercase;color:var(--muted);white-space:nowrap;width:32%">'+label+'</td>' +
-      '<td style="padding:7px 10px;font-size:13px;font-weight:600;color:'+(empty?'var(--red)':'var(--text)')+'">'+badge(key)+(empty?'Non renseigné':(key==='loyer_ttc'?val+' €':val))+'</td>' +
+      '<td style="padding:7px 10px;font-size:13px;font-weight:600;color:'+displayColor+'">'+badge(key)+'<span id="'+dispId+'">'+displayVal+'</span></td>' +
       '<td style="padding:7px 6px;width:24px;text-align:center"><span onclick="toggleEdit(this,\''+key+'\')" style="cursor:pointer;font-size:11px;color:var(--muted)">✎</span></td>' +
       '</tr>' +
-      '<tr id="erow_'+key+'" style="display:none;background:var(--orange-lt)"><td colspan="3" style="padding:2px 10px 7px">' +
-      '<input type="text" id="edit_'+key+'" value="'+val.replace(/"/g,'&quot;')+'" data-key="'+key+'" oninput="markEditKey(this)" ' +
-      'style="width:100%;border:1.5px solid var(--orange);border-radius:5px;padding:5px 8px;font-size:12px;font-family:inherit;outline:none;background:#fff"></td></tr>';
+      '<tr id="'+editRowId+'" style="display:none;background:var(--orange-lt)"><td colspan="3" style="padding:2px 10px 7px">' +
+      '<div style="display:flex;gap:6px;align-items:center">' +
+      '<input type="text" id="edit_'+key+'" value="'+val.replace(/"/g,'&quot;')+'" data-key="'+key+'" ' +
+      'style="flex:1;border:1.5px solid var(--orange);border-radius:5px;padding:5px 8px;font-size:12px;font-family:inherit;outline:none;background:#fff">' +
+      '<button onclick="validateEdit(\''+key+'\')" style="background:var(--green);color:#fff;border:none;border-radius:5px;padding:5px 10px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit">✓</button>' +
+      '</div></td></tr>';
   };
 
   const svcBadge = (key, label) => {
     const val = String(D[key]||'nc');
-    const ok = val==='oui';
-    return '<div style="background:'+(ok?'var(--green-lt)':'var(--surface)')+';border:1px solid '+(ok?'var(--green-bd)':'var(--border)')+';border-radius:6px;padding:5px 9px;font-size:12px;font-weight:600;color:'+(ok?'var(--green)':'var(--muted)')+'">'+
-      (ok?'✅':'—')+' '+label+'</div>';
+    const ok = val==='oui'; const no = val==='non';
+    const bg = ok?'var(--green-lt)':no?'var(--red-lt)':'var(--surface)';
+    const border = ok?'var(--green-bd)':no?'var(--red-bd)':'var(--border)';
+    const color = ok?'var(--green)':no?'var(--red)':'var(--muted)';
+    const icon = ok?'✅':no?'🚫':'—';
+    return '<div onclick="toggleSvc(\''+key+'\')" title="Cliquer pour changer" ' +
+      'style="background:'+bg+';border:1px solid '+border+';border-radius:6px;padding:5px 9px;font-size:12px;font-weight:600;color:'+color+';cursor:pointer;user-select:none;transition:all .15s" ' +
+      'id="svcbadge_'+key+'">' +
+      icon+' '+label+'</div>';
   };
 
   // Separate anomalies from green
@@ -976,7 +1086,7 @@ function renderAnalysis() {
         <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px">Analyse terminée</div>
         <div style="font-size:16px;font-weight:700;color:var(--navy)">${g('societe')||'Société inconnue'}</div>
       </div>
-      <div style="display:flex;gap:7px;flex-wrap:wrap">
+      <div style="display:flex;gap:7px;flex-wrap:wrap" id="anomCounters">
         ${redCount>0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:var(--red-lt);color:var(--red);border:1px solid var(--red-bd)">🚫 '+redCount+' bloquant'+(redCount>1?'s':'')+'</div>':''}
         ${orangeCount>0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:var(--orange-lt);color:var(--orange);border:1px solid var(--orange-bd)">⚠️ '+orangeCount+' à vérifier</div>':''}
         ${redCount===0&&orangeCount===0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:var(--green-lt);color:var(--green);border:1px solid var(--green-bd)">✅ Conforme</div>':''}
@@ -1045,10 +1155,10 @@ function renderAnalysis() {
       </div>
 
       <div class="section-card" style="grid-column:1/-1">
-        <div class="sc-head" style="${contractAnom.length?'background:var(--orange);color:#fff':''}">
+        <div class="sc-head" id="anomaliesHead" style="${contractAnom.length?'background:var(--orange);color:#fff':''}">
           ${contractAnom.length?'⚠️ Anomalies à corriger':'✅ Aucune anomalie'}
         </div>
-        <div class="sc-body" style="padding:8px">${anomHtml}</div>
+        <div class="sc-body" style="padding:8px" id="anomaliesBox">${anomHtml}</div>
       </div>
 
       <div class="section-card" style="grid-column:1/-1">
@@ -1105,6 +1215,96 @@ function renderAnalysis() {
 function toggleEdit(el, key) {
   const row = document.getElementById('erow_'+key);
   if (row) row.style.display = row.style.display==='none'?'table-row':'none';
+}
+
+function validateEdit(key) {
+  const inp = document.getElementById('edit_'+key);
+  if (!inp) return;
+  const val = inp.value.trim();
+  if (!D[key]) D[key] = {v:'',c:'high'};
+  D[key].v = val; D[key].edited = true;
+  const disp = document.getElementById('disp_'+key);
+  if (disp) disp.textContent = val || 'Non renseigné';
+  const row = document.getElementById('erow_'+key);
+  if (row) row.style.display = 'none';
+  const labels = {societe:'Société',bce:'BCE/TVA',adresse:'Adresse',email:'Email',tel:'Téléphone',
+    contact:'Contact',peppol:'Peppol',iban:'IBAN',commercial:'Commercial',caisse:'Caisse',
+    loyer_ttc:'Loyer',duree_mois:'Durée',nbre_loyers:'Nb loyers'};
+  const msg = 'Corriger '+(labels[key]||key)+' : '+val;
+  const idx = ACTIONS.findIndex(a=>a.msg.startsWith('Corriger '+(labels[key]||key)));
+  if (idx>=0) ACTIONS[idx].msg=msg; else addAction('o',msg);
+  refreshAnomalies();
+}
+
+function validateSelect(key) {
+  const sel = document.getElementById('sel_'+key);
+  if (!sel) return;
+  const val = sel.value;
+  if (!D[key]) D[key] = {v:'',c:'high'};
+  D[key].v = val; D[key].edited = true;
+  const disp = document.getElementById('disp_'+key);
+  if (disp) disp.textContent = val || 'Non renseigné';
+  const row = document.getElementById('erow_'+key);
+  if (row) row.style.display = 'none';
+  const labels = {modele:'Modèle',connect:'Connectivité',kit:'Kit',dx_ref:'Réf DX',
+    location_type:'Location',civilite:'Civilité',abonnement:'Abonnement'};
+  const msg = 'Modifier '+(labels[key]||key)+' : '+val;
+  const idx = ACTIONS.findIndex(a=>a.msg.startsWith('Modifier '+(labels[key]||key)));
+  if (idx>=0) ACTIONS[idx].msg=msg; else addAction('o',msg);
+  refreshAnomalies();
+}
+
+function updateSelectField(sel, key) {
+  validateSelect(key);
+}
+
+function toggleSvc(key) {
+  const states = ['oui','non','nc'];
+  const cur = String(D[key]||'nc');
+  const next = states[(states.indexOf(cur)+1)%3];
+  D[key] = next;
+  const badge = document.getElementById('svcbadge_'+key);
+  if (badge) {
+    const ok = next==='oui'; const no = next==='non';
+    badge.style.background = ok?'var(--green-lt)':no?'var(--red-lt)':'var(--surface)';
+    badge.style.borderColor = ok?'var(--green-bd)':no?'var(--red-bd)':'var(--border)';
+    badge.style.color = ok?'var(--green)':no?'var(--red)':'var(--muted)';
+    const labels = {svc_cc:'CB',svc_cr:'Chèques-repas',svc_ores:'ORES',svc_barra:'Barracuda',
+      svc_eid:'Lecteur ID',svc_pad:'Paiem. distance',svc_dcc:'DCC',svc_backup:'Backup'};
+    badge.innerHTML = (ok?'✅':no?'🚫':'—')+' '+(labels[key]||key);
+  }
+  addAction('o','Service '+(key.replace('svc_','').toUpperCase())+' → '+next);
+  refreshAnomalies();
+}
+
+function refreshAnomalies() {
+  ANOMALIES = detectAnomalies(D);
+  const redCount = ANOMALIES.filter(a=>a.sev==='red').length;
+  const orangeCount = ANOMALIES.filter(a=>a.sev==='orange').length;
+  const contractAnom = ANOMALIES.filter(a=>a.sev!=='green');
+  const anomHtml = contractAnom.length===0
+    ? '<div style="padding:8px;font-size:13px;color:var(--green);font-weight:600">Aucun problème détecté.</div>'
+    : contractAnom.map(a=>
+        '<div style="display:flex;gap:8px;padding:8px 10px;border-radius:6px;margin-bottom:5px;background:'+(a.sev==='red'?'var(--red-lt)':'var(--orange-lt)')+';border-left:3px solid '+(a.sev==='red'?'var(--red)':'var(--orange)')+'">'+
+        '<span>'+(a.sev==='red'?'🚫':'⚠️')+'</span>'+
+        '<div><div style="font-size:12px;font-weight:700;color:'+(a.sev==='red'?'var(--red)':'var(--orange)')+'">'+a.title+'</div>'+
+        '<div style="font-size:11px;color:var(--muted)">'+a.desc+'</div></div></div>'
+      ).join('');
+  const anomBox = document.getElementById('anomaliesBox');
+  if (anomBox) { anomBox.innerHTML = anomHtml; }
+  const head = document.getElementById('anomaliesHead');
+  if (head) {
+    head.style.background = contractAnom.length?'var(--orange)':'';
+    head.style.color = contractAnom.length?'#fff':'';
+    head.textContent = contractAnom.length?'⚠️ Anomalies à corriger':'✅ Aucune anomalie';
+  }
+  const ctr = document.getElementById('anomCounters');
+  if (ctr) {
+    ctr.innerHTML =
+      (redCount>0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:var(--red-lt);color:var(--red);border:1px solid var(--red-bd)">🚫 '+redCount+' bloquant'+(redCount>1?'s':'')+'</div>':'')+
+      (orangeCount>0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:var(--orange-lt);color:var(--orange);border:1px solid var(--orange-bd)">⚠️ '+orangeCount+' à vérifier</div>':'')+
+      (redCount===0&&orangeCount===0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:var(--green-lt);color:var(--green);border:1px solid var(--green-bd)">✅ Conforme</div>':'');
+  }
 }
 
 function markEditKey(inp) {
