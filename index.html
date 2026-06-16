@@ -722,7 +722,12 @@ En cas de doute → "nc". Ne jamais inventer ou enrichir le contenu. Les notes_c
 
 ═══ SECTION 1 — BON DE COMMANDE INOCREA ═══
 Page avec double logo Inocrea + Worldline en haut.
-- Extrais : societe, bce, adresse, email, tel, contact, peppol, iban, commercial, date_signature, civilite
+- Extrais : societe, bce, email, tel, contact, peppol, iban, commercial, date_signature, civilite
+- adresse_facturation : champ "Siège social" (bon Inocrea) ou "Adresse (siège social)" / "Informations de facturation" (bon Worldline). C'est l'adresse principale de la société.
+- adresse_livraison : champ "Adresse livraison" (bon Inocrea) ou "Informations du site d'exploitation" (bon Worldline).
+  RÈGLE IMPORTANTE : si ce champ contient "idem", "idem ci-dessus", des guillemets de répétition (″, ‶, ", ou des petits traits "), ou est simplement vide alors que le champ facturation est rempli → adresse_livraison = copie exacte de adresse_facturation (confiance "med").
+  Si une vraie adresse différente est écrite dans le champ dédié → la retranscrire telle quelle (confiance "high").
+  Si le champ dédié est vide/illisible MAIS qu'une adresse différente du siège social apparaît dans les Notes manuscrites → l'utiliser comme adresse_livraison (confiance "med") et le préciser dans notes_contrat.
 - modele : "RX5000" si ligne RX5000 cochée/montant renseigné, "DX8000" si ligne DX8000, "Yomani Double Module", "MarketPay PAX A8500 + Q25", "MarketPay PAX A8900", sinon "Inconnu"
 - connect : WiFi / 4G / Ethernet selon case cochée
 - nb : quantité dans la colonne Qté du bon Inocrea. Si la colonne Qté est vide alors que le terminal est sélectionné → nb=0 ET qte_manquante_inocrea=true
@@ -778,7 +783,8 @@ JSON à retourner :
 {
   "societe": {"v":"","c":"high"},
   "bce": {"v":"","c":"high"},
-  "adresse": {"v":"","c":"high"},
+  "adresse_facturation": {"v":"","c":"high"},
+  "adresse_livraison": {"v":"","c":"high"},
   "email": {"v":"","c":"high"},
   "tel": {"v":"","c":"high"},
   "contact": {"v":"","c":"high"},
@@ -1101,7 +1107,8 @@ function renderAnalysis() {
           <table style="width:100%;border-collapse:collapse">
             ${row('Société','societe')}
             ${row('BCE / TVA','bce')}
-            ${row('Adresse de livraison','adresse')}
+            ${row('Adresse facturation','adresse_facturation')}
+            ${row('Adresse livraison','adresse_livraison')}
             ${row('Email','email')}
             ${row('Tél / GSM','tel')}
             ${row('Contact','contact')}
@@ -1109,6 +1116,15 @@ function renderAnalysis() {
             ${row('IBAN','iban')}
             ${row('Commercial','commercial')}
           </table>
+          ${(() => {
+            const af = g('adresse_facturation').trim().toLowerCase();
+            const al = g('adresse_livraison').trim().toLowerCase();
+            if (af && al && af !== al) {
+              return '<div style="margin-top:8px;padding:8px 10px;background:var(--blue-lt,#EFF6FF);border-left:3px solid var(--blue,#3B82F6);border-radius:6px;font-size:12px;color:var(--text)">'+
+                'ℹ️ <b>Adresse de livraison différente</b> de l\'adresse de facturation — à confirmer avec le client lors de l\'installation.</div>';
+            }
+            return '';
+          })()}
         </div>
       </div>
 
@@ -1227,7 +1243,7 @@ function validateEdit(key) {
   if (disp) disp.textContent = val || 'Non renseigné';
   const row = document.getElementById('erow_'+key);
   if (row) row.style.display = 'none';
-  const labels = {societe:'Société',bce:'BCE/TVA',adresse:'Adresse',email:'Email',tel:'Téléphone',
+  const labels = {societe:'Société',bce:'BCE/TVA',adresse_facturation:'Adresse facturation',adresse_livraison:'Adresse livraison',email:'Email',tel:'Téléphone',
     contact:'Contact',peppol:'Peppol',iban:'IBAN',commercial:'Commercial',caisse:'Caisse',
     loyer_ttc:'Loyer',duree_mois:'Durée',nbre_loyers:'Nb loyers'};
   const msg = 'Corriger '+(labels[key]||key)+' : '+val;
@@ -1313,7 +1329,7 @@ function markEditKey(inp) {
   if (!D[key]) D[key] = {v:'',c:'high'};
   D[key].v = val;
   D[key].edited = true;
-  const labels = {societe:'Société',bce:'BCE/TVA',adresse:'Adresse de livraison',email:'Email',tel:'Téléphone',
+  const labels = {societe:'Société',bce:'BCE/TVA',adresse_facturation:'Adresse facturation',adresse_livraison:'Adresse livraison',email:'Email',tel:'Téléphone',
     modele:'Modèle',connect:'Connectivité',nb:'Nb terminaux',kit:'Kit',caisse:'Caisse',
     dx_ref:'Réf DX',location_type:'Location',loyer_ttc:'Loyer',duree_mois:'Durée',commercial:'Commercial'};
   const msg = 'Corriger '+(labels[key]||key)+' : '+val;
@@ -1479,8 +1495,8 @@ function buildTrame() {
   );
 
       // ── SECTION 2 : INFOS CLIENT (modifiables inline) ───────────────────────
-  var infoKeys = ['societe','bce','adresse','email','tel'];
-  var infoLabels = {societe:'Société',bce:'BCE / TVA',adresse:'Adresse de livraison',email:'Email',tel:'Téléphone'};
+  var infoKeys = ['societe','bce','adresse_facturation','adresse_livraison','email','tel'];
+  var infoLabels = {societe:'Société',bce:'BCE / TVA',adresse_facturation:'Adresse facturation',adresse_livraison:'Adresse livraison',email:'Email',tel:'Téléphone'};
   var infoRows = infoKeys.map(function(k){
     var val = String(D[k]&&D[k].v?D[k].v:'—');
     return '<tr style="border-bottom:1px solid rgba(255,255,255,.08)">'+
@@ -1496,7 +1512,7 @@ function buildTrame() {
   );
   // Add blur listeners after section is in DOM
   setTimeout(function(){
-    ['societe','bce','adresse','email','tel'].forEach(function(k){
+    ['societe','bce','adresse_facturation','adresse_livraison','email','tel'].forEach(function(k){
       var el = document.getElementById('ti_'+k);
       if(!el) return;
       el.addEventListener('focus', function(){ this.style.background='rgba(255,255,255,.08)'; });
@@ -2484,7 +2500,7 @@ function trameEditUpdate(el, key) {
   if(!D[key]) D[key] = {v:'',c:'high'};
   D[key].v = val;
   D[key].edited = true;
-  const labels = {societe:'Société',bce:'BCE/TVA',adresse:'Adresse de livraison',email:'Email',tel:'Téléphone'};
+  const labels = {societe:'Société',bce:'BCE/TVA',adresse_facturation:'Adresse facturation',adresse_livraison:'Adresse livraison',email:'Email',tel:'Téléphone'};
   const msg = 'Corriger '+labels[key]+' → '+val;
   const idx2 = ACTIONS.findIndex(function(a){ return a.msg && a.msg.startsWith('Corriger '+labels[key]); });
   if(idx2>=0) ACTIONS[idx2].msg=msg; else addAction('o',msg);
@@ -2885,7 +2901,8 @@ function buildRecap() {
       '<table class="rtable" style="width:100%;table-layout:fixed"><thead>'+thead+'</thead><tbody>'+
       row2('Société','societe')+
       row2('BCE / TVA','bce')+
-      row2('Adresse de livraison','adresse')+
+      row2('Adresse facturation','adresse_facturation')+
+      row2('Adresse livraison','adresse_livraison')+
       row2('Email','email')+
       row2('Téléphone','tel')+
       row2('Contact','contact')+
@@ -3038,7 +3055,8 @@ function genPDF() {
   const corr=(id)=>{const e=document.getElementById(id);return e?e.value.trim():'';};
 
   sec('IDENTIFICATION');
-  row('Societe',g('societe'));row('BCE / TVA',g('bce'));row('Adresse de livraison',g('adresse'));
+  row('Societe',g('societe'));row('BCE / TVA',g('bce'));
+  row('Adresse facturation',g('adresse_facturation'));row('Adresse livraison',g('adresse_livraison'));
   row('Email',g('email'));row('Tel',g('tel'));row('Peppol ID',g('peppol'));row('IBAN',g('iban'));
   if(corr('corr_soc')) row('Societe CORR.',corr('corr_soc'),true);
   if(corr('corr_bce')) row('BCE CORR.',corr('corr_bce'),true);
@@ -3256,7 +3274,7 @@ function buildEmailContent() {
   var g = t.greeting(civ, nom);
   var fields = [
     ['Société', soc],
-    [t.adresse, (D.adresse&&D.adresse.v)||''],
+    [t.adresse, (D.adresse_facturation&&D.adresse_facturation.v)||''],
     [t.email_label, emailTo],
     [t.tel, (D.tel&&D.tel.v)||''],
     ['IBAN', (D.iban&&D.iban.v)||'']
