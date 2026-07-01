@@ -709,6 +709,7 @@ function startAnalysis(file) {
 
       ANOMALIES = detectAnomalies(result);
       renderAnalysis();
+      saveAnalysisToKV('email'); // Sauvegarde dès la fin de l'analyse
     } catch(err) {
       console.error(err);
       renderAnalysisError(err.message);
@@ -3251,7 +3252,6 @@ function goNext() {
     document.getElementById('step2').style.display='none';
     document.getElementById('step3').style.display='block';
     buildRecap();
-    saveAnalysisToKV('email');
     document.getElementById('stp1').className='step done';
     document.getElementById('stp2').className='step active';
     var _n=document.getElementById('btnNext'); if(_n) _n.classList.add('hidden');
@@ -3312,22 +3312,27 @@ async function saveAnalysisToKV(source) {
     const payload = {
       source: source || 'email',
       commercial: D.commercial?.v || '',
-      societe: D.societe?.v || '',
+      societe: (D.societe?.v || '').toUpperCase(),
       bce: D.bce?.v || '',
+      date_signature: D.date_signature?.v || '',
       modele: D.modele?.v || '',
       location_type: D.location_type?.v || '',
       duree_mois: D.duree_mois?.v || '',
-      anomalies: ANOMALIES.filter(a=>a.sev==='red'||a.sev==='orange').map(a=>({sev:a.sev,title:a.title})),
+      anomalies: ANOMALIES.filter(a=>a.sev==='red'||a.sev==='orange').map(a=>({sev:a.sev,title:a.title,desc:a.desc})),
       actions: ANOMALIES.filter(a=>a.sev==='action').map(a=>({title:a.title})),
       statut,
       nb_red: redCount,
       nb_orange: orangeCount,
     };
-    await fetch('https://quiet-bonus-454e.olivierdubost.workers.dev/save-analysis', {
+    const resp = await fetch('https://quiet-bonus-454e.olivierdubost.workers.dev/save-analysis', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify(payload)
     });
+    const result = await resp.json();
+    if (result.duplicate) {
+      console.info('KV: dossier déjà enregistré (doublon BCE+date_signature)');
+    }
   } catch(e) {
     console.warn('KV save failed (non-bloquant):', e.message);
   }
