@@ -653,6 +653,52 @@ function startAnalysis(file) {
       animateLoader(3);
       await new Promise(r => setTimeout(r, 300));
       D = result;
+
+      // ── Séparer tel/gsm si l'IA n'a pas séparé ──
+      if (D.tel?.v && !D.gsm?.v) {
+        const num = D.tel.v.replace(/\s/g,'');
+        if (/^04[5-9]/.test(num)) {
+          D.gsm = {v: D.tel.v, c: D.tel.c};
+          D.tel = {v: '', c: 'low'};
+        }
+      }
+
+      // ── Construction Peppol ID depuis BCE (format 0208:XXXXXXXXX) ──
+      if (D.bce?.v) {
+        const bceNum = D.bce.v.replace(/[^0-9]/g,'');
+        const peppolCorrect = '0208:' + bceNum;
+        const wasValue = D.peppol?.v || '';
+        const wasClean = wasValue.replace(/[\s\-]/g,'');
+        if (wasClean !== peppolCorrect) {
+          D.peppol = {v: peppolCorrect, c: 'med', edited: true, _was: wasValue};
+          D._peppol_found = true;
+        } else {
+          D.peppol = {v: peppolCorrect, c: 'high'};
+          D._peppol_found = true;
+        }
+        try {
+          const peppolResp = await fetch('https://directory.peppol.eu/public/search/1.0/json?q=' + bceNum + '&country=BE', {headers:{'Accept':'application/json'}});
+          if (peppolResp.ok) {
+            const peppolData = await peppolResp.json();
+            if ((peppolData?.matches||[]).length === 0) D._peppol_found = false;
+          }
+        } catch(e) {}
+      }
+
+      // ── Correction page_cr_absente : si services_vaa détecté, forcer false ──
+      if (Array.isArray(D.pages_ordre) && D.pages_ordre.includes('services_vaa')) {
+        D.page_cr_absente = false;
+      }
+
+      // ── Marquer durée en rouge si > 63 mois ──
+      const _duree = parseInt(String(D.duree_mois?.v||'0').replace(/[^0-9]/g,'')) || 0;
+      const _loyers = parseInt(String(D.nbre_loyers?.v||'0').replace(/[^0-9]/g,'')) || 0;
+      const _dureeEff = _duree || (_loyers * 3);
+      if (_dureeEff > 63 && _dureeEff > 0) {
+        if (D.duree_mois) D.duree_mois.c = 'low';
+        if (D.nbre_loyers) D.nbre_loyers.c = 'low';
+      }
+
       ANOMALIES = detectAnomalies(result);
       renderAnalysis();
     } catch(err) {
@@ -722,15 +768,15 @@ En cas de doute → "nc". Ne jamais inventer ou enrichir le contenu. Les notes_c
 
 ═══ SECTION 1 — BON DE COMMANDE INOCREA ═══
 Page avec double logo Inocrea + Worldline en haut.
-- Extrais : societe, bce, email, tel, contact, peppol, iban, commercial, date_signature, civilite
-- adresse_facturation : champ "Siège social" (bon Inocrea) ou "Adresse (siège social)" / "Informations de facturation" (bon Worldline). C'est l'adresse principale de la société.
-- adresse_livraison : champ "Adresse livraison" (bon Inocrea) ou "Informations du site d'exploitation" (bon Worldline).
-  RÈGLE IMPORTANTE : si ce champ contient "idem", "idem ci-dessus", des guillemets de répétition (″, ‶, ", ou des petits traits "), ou est simplement vide alors que le champ facturation est rempli → adresse_livraison = copie exacte de adresse_facturation (confiance "med").
-  Si une vraie adresse différente est écrite dans le champ dédié → la retranscrire telle quelle (confiance "high").
-  Si le champ dédié est vide/illisible MAIS qu'une adresse différente du siège social apparaît dans les Notes manuscrites → l'utiliser comme adresse_livraison (confiance "med") et le préciser dans notes_contrat.
+- Extrais : societe, bce, email, contact, peppol, iban, commercial, date_signature, civilite
+- tel : numéro de téléphone FIXE uniquement (commence par 02, 03, 04 hors mobile, 050-089).
+- gsm : numéro de téléphone MOBILE uniquement. En Belgique, les GSM commencent par 045x, 046x, 047x, 048x ou 049x. Si un seul numéro commence par 04x → mettre dans gsm, laisser tel vide.
+- peppol : extraire tel quel du contrat.
+- adresse_facturation : champ "Siège social" (bon Inocrea) ou "Informations de facturation" (bon Worldline).
+- adresse_livraison : champ "Adresse livraison". Si "idem" ou guillemets → copie de adresse_facturation (confiance "med").
 - modele : "RX5000" si ligne RX5000 cochée/montant renseigné, "DX8000" si ligne DX8000, "Yomani Double Module", "MarketPay PAX A8500 + Q25", "MarketPay PAX A8900", sinon "Inconnu"
 - connect : WiFi / 4G / Ethernet selon case cochée
-- nb : quantité dans la colonne Qté du bon Inocrea. Si la colonne Qté est vide alors que le terminal est sélectionné → nb=0 ET qte_manquante_inocrea=true
+- nb : quantité dans la colonne Qté du bon Inocrea. Si vide alors que terminal sélectionné → nb=0 ET qte_manquante_inocrea=true
 - location_type : "Grenke" si Option 1 cochée, "Inocrea" si Option 2, "Achat" si Option 3
 - loyer_ttc, nbre_loyers (nombre de loyers trimestriels), duree_mois
 - CALCUL DURÉE : périodicité toujours trimestrielle. Si duree_mois vide mais nbre_loyers présent → duree_mois = nbre_loyers × 3 (confiance "med"). Si nbre_loyers vide mais duree_mois présent → nbre_loyers = duree_mois / 3 (confiance "med").
@@ -739,45 +785,70 @@ Page avec double logo Inocrea + Worldline en haut.
 
 ═══ SECTION 2 — BON DE COMMANDE WORLDLINE ═══
 Pages avec entête Worldline uniquement (pas le bon Inocrea).
-- Pour chaque ligne de terminal ou kit cochée/sélectionnée (RX5000, DX8000, Kit Start, Kit Pro, câbles...) : vérifier si la colonne Qté contient un chiffre.
-- Si une ligne est cochée/sélectionnée ET que sa colonne Qté est vide ou nulle → qte_manquante_worldline=true
-- Si toutes les lignes cochées ont bien une quantité renseignée → qte_manquante_worldline=false
+- Pour chaque ligne de terminal ou kit cochée : vérifier si la colonne Qté contient un chiffre.
+- Si ligne cochée ET colonne Qté vide → qte_manquante_worldline=true
+- Si ligne cochée ET colonne Qté illisible (symbole, trait) → qte_illisible_worldline=true
+- Si chiffre clairement lisible → les deux à false
 - kit : "pro" si Kit Pro coché (4002401200), "start" si Kit Start coché (4002480950), "aucun" sinon
 - dx_ref : "C01602" ou "C01615" pour DX8000, "C01603" pour RX5000, sinon "autre" ou "aucun"
 
-═══ SECTION 6 — SERVICES ═══
-Analyse les pages "Cartes de paiement" et "Services à valeur ajoutée" (si elles ne sont PAS barrées).
-
-svc_cc = "oui" si la case "Activation Cartes Internationales : 10,00€" est cochée (petit ✓ dans le carré) sur la page Cartes de paiement, et que cette page n'est PAS barrée. Une seule case cochée suffit — pas besoin que Visa ou Mastercard soient également sélectionnés séparément.
-svc_cr = "oui" si les chèques-repas sont cochés (Edenred, Monizze, Pluxee, Sodexo...) sur une page non barrée.
-svc_dcc = "oui" UNIQUEMENT si la case DCC est cochée sur une page NON barrée. Si la page est barrée → "nc". Attention : DCC est souvent pré-coché "Ja" sur la page néerlandaise qui peut être barrée.
-svc_backup = "oui" UNIQUEMENT si la case Backup mode est cochée sur une page NON barrée.
-svc_ores = "oui" si ORES est coché.
-svc_barra = "oui" si Barracuda est coché.
-svc_eid = "oui" si lecteur carte d'identité est coché.
-svc_pad = "oui" si paiement à distance est coché.
-Pour tout service non mentionné ou sur page barrée → "nc".
+═══ SECTION 3 — SYSTÈME DE CAISSE ═══
 Obligatoire si modele = RX5000. Liste officielle des systèmes valides :
 3GO Software, 4Retail, ACA Fashion Software, AH Automation, Alfazet, Becosoft, Beniro Optix, Biesbroeck Automation, Bizarre/Horecakassa, Bizerba, Bolt MPlus, Carfac/WASP, Centric, Cerme ICT, Corilus BE, Corilus NL, Cowhills, Created Software CR8ED, CTAC, Datacon, Deligo Vision, Diebold Nixdorf, Diomedia, EasyPOS, Eatcard, EDDS Technology, Euresisoft, Flyx Cloud, Fujiton/K-Rent, Futurekassasystemen/Paysofort, Greenisland/Kate, Hanos, Heijne BV, Index Hospitality System, Ineo Mercator, Initeam, Insys, Intec Software, Intelart, JES, KassaNoord/KassaNuus, Leza BV, Marti Orbak, Nedfox, Neo Company, Officinall, Orkhon, Pharmony, QIOX, R2Retail Solutions/Hendrickx, Reconneqt/Anchr/AXI, Recreanet, Restomax, Retail4U/Eurosisoft, RetailDesk, Sanders Techniek/STN, Scanfie, SDP/Alistar, Simac, Slytio, SoftTouch, Software Support Nederland, Straight Systems, TCOG, Terminal Session, Tilroy, Toshiba, Twelve, Valk Solutions, Van Hessen, Vendit, Verdesoft, VetsWare, Vintia/Gantner, Winfakt BV, Xaris, Yina Solutions, Your POS, Zorgi.
-- Si le texte correspond exactement → caisse_statut="valide"
-- Si le texte ressemble à un nom de la liste (faute d'orthographe probable) → caisse_statut="reconfirmer" et caisse_suggestion="[nom officiel probable]"
+- Si texte exact → caisse_statut="valide"
+- Si ressemble à un nom de la liste → caisse_statut="reconfirmer" et caisse_suggestion="[nom officiel probable]"
 - Si totalement inconnu → caisse_statut="inconnu"
 - Si vide et modele=RX5000 → caisse_statut="manquant"
 
 ═══ SECTION 4 — CARTE D'IDENTITÉ ═══
 RECTO = face avec PHOTO DE VISAGE + nom, prénom, date naissance, date validité, numéro carte. PAS de MRZ.
-VERSO = face SANS photo, avec numéro registre national, code-barres, MRZ (3 lignes de chiffres/lettres type IDBEL...). PAS de photo de visage.
+VERSO = face SANS photo, avec numéro registre national, code-barres, MRZ (3 lignes type IDBEL...). PAS de photo de visage.
 - doc_ci_recto = true UNIQUEMENT si photo de visage clairement visible
-- doc_ci_verso = true UNIQUEMENT si MRZ visible (lignes type IDBEL...) sans photo de visage
+- doc_ci_verso = true UNIQUEMENT si MRZ visible sans photo de visage
 - doc_ci_couleur = true si teinte verte/bleue caractéristique des CI belges, false si grise/photocopie N&B
 - doc_ci_valide = true si date "valide jusqu'au" postérieure à juin 2026
-- doc_ci_qualite = "high" si nette et lisible, "med" si acceptable, "low" si floue/illisible
+- doc_ci_qualite = "high" si nette, "med" si acceptable, "low" si floue/illisible
 - doc_ci_nom : nom + prénom tel que lu sur le recto
 
 ═══ SECTION 5 — RIB / ATTESTATION BANCAIRE ═══
 Page avec logo de banque belge (Belfius, ING, BNP Paribas Fortis, KBC, Bpost Bank, Nagelmackers, Crelan, Argenta, Triodos, Fintro...) et un IBAN professionnel.
 - doc_rib_iban_match = true si IBAN du RIB = IBAN du contrat (ignore espaces et tirets)
 - doc_rib_ok = true si banque identifiable + société visible + IBAN correspondant au contrat
+
+═══ SECTION 6 — SERVICES ═══
+Analyse les pages "Cartes de paiement" et "Services à valeur ajoutée" (si elles ne sont PAS barrées).
+svc_cc = "oui" si la case "Activation Cartes Internationales : 10,00€" est cochée sur la page Cartes de paiement non barrée.
+svc_cr = "oui" si les chèques-repas sont cochés (Edenred, Monizze, Pluxee, Sodexo...) sur une page non barrée.
+svc_dcc = "oui" UNIQUEMENT si la case DCC est cochée sur une page NON barrée. Si barrée → "nc".
+svc_backup = "oui" UNIQUEMENT si la case Backup mode est cochée sur une page NON barrée.
+svc_ores = "oui" si ORES est coché. svc_barra = "oui" si Barracuda est coché.
+svc_eid = "oui" si lecteur carte d'identité est coché. svc_pad = "oui" si paiement à distance est coché.
+Pour tout service non mentionné ou sur page barrée → "nc".
+
+═══ SECTION 7 — BANCONTACT ═══
+Sur la page "Cartes de paiement" / "Bancontact" :
+bancontact_par_transaction=true si TOUTES ces conditions sont réunies :
+1. Aucune case cochée dans "Bancontact BOOST" (vide ou barré)
+2. Aucune case cochée dans "Bancontact abonnement" (vide ou barré)
+3. Un tarif/montant est renseigné dans la ligne "Bancontact par transaction"
+Dans ce cas : bancontact_par_transaction=true et bancontact_tarif=le montant lu.
+Si au moins une case cochée dans BOOST ou abonnement → bancontact_par_transaction=false.
+
+═══ SECTION 8 — PAGE CHÈQUES REPAS ═══
+RÈGLE CRITIQUE : La page chèques repas est TOUJOURS sur la même page que "Services à valeur ajoutée" (Backup mode + DCC + Chèques repas). Il n'y a PAS de page séparée.
+- Si page "Services à valeur ajoutée" présente → page_cr_absente=FALSE obligatoirement.
+- page_cr_absente=TRUE UNIQUEMENT si cette page est complètement absente du PDF.
+- Cases non cochées ≠ page absente → page_cr_absente=FALSE dans ce cas.
+
+═══ SECTION 9 — QUANTITÉ WORLDLINE ILLISIBLE ═══
+- Ligne cochée + colonne Qté contient quelque chose d'illisible → qte_illisible_worldline=true
+- Colonne Qté clairement vide → qte_manquante_worldline=true
+- Chiffre clairement lisible → les deux à false
+
+═══ SECTION 10 — ORDRE DES PAGES (contrats Worldline/Inocrea uniquement) ═══
+Identifie le type de chaque page dans l'ordre où elle apparaît dans le PDF et retourne dans "pages_ordre".
+Types : "bon_inocrea", "bon_worldline", "bancontact", "cartes_inter", "bon_terminal", "services_vaa", "rib", "ci_recto", "ci_verso", "autre"
+Ordre CORRECT Worldline : bon_inocrea → bon_worldline → bancontact → cartes_inter → bon_terminal → services_vaa → (puis rib/ci libres)
 
 JSON à retourner :
 {
@@ -787,6 +858,7 @@ JSON à retourner :
   "adresse_livraison": {"v":"","c":"high"},
   "email": {"v":"","c":"high"},
   "tel": {"v":"","c":"high"},
+  "gsm": {"v":"","c":"high"},
   "contact": {"v":"","c":"high"},
   "peppol": {"v":"","c":"high"},
   "iban": {"v":"","c":"high"},
@@ -797,6 +869,7 @@ JSON à retourner :
   "connect": {"v":"WiFi|4G|Ethernet","c":"high"},
   "nb": {"v":1,"c":"high"},
   "qte_manquante_inocrea": false,
+  "qte_illisible_worldline": false,
   "qte_manquante_worldline": false,
   "kit": {"v":"start|pro|aucun","c":"high"},
   "dx_ref": {"v":"C01602|C01615|C01603|autre|aucun","c":"high"},
@@ -820,6 +893,10 @@ JSON à retourner :
   "iban_visible": true,
   "peppol_visible": true,
   "notes_contrat": "",
+  "page_cr_absente": false,
+  "bancontact_par_transaction": false,
+  "bancontact_tarif": "",
+  "pages_ordre": [],
   "doc_rib_present": false,
   "doc_rib_banque": "",
   "doc_rib_societe": "",
@@ -860,103 +937,188 @@ JSON à retourner :
 }
 
 // ============================================================
-// ANOMALY DETECTION
+// ANOMALY DETECTION — 2 sections : contrat + welcome call
 // ============================================================
 function detectAnomalies(d) {
   var an = [];
   function add(sev, title, desc) { an.push({sev:sev, title:title, desc:desc}); }
 
+  // ── ORDRE DES PAGES ──
+  const CORRECT_ORDER = ['bon_inocrea','bon_worldline','bancontact','cartes_inter','bon_terminal','services_vaa'];
+  const pages = Array.isArray(d.pages_ordre) ? d.pages_ordre : [];
+  if (pages.length > 0) {
+    const contractPages = pages.filter(p => CORRECT_ORDER.includes(p));
+    let orderErrors = [], lastIdx = -1;
+    const pageLabels = {bon_inocrea:'Bon de commande Inocrea',bon_worldline:'Bon de commande Worldline',bancontact:'Cartes de paiement — Bancontact',cartes_inter:'Cartes de paiement — Cartes internationales',bon_terminal:'Bon de commande terminal',services_vaa:'Services à valeur ajoutée'};
+    contractPages.forEach(function(p) {
+      const expectedIdx = CORRECT_ORDER.indexOf(p);
+      if (expectedIdx < lastIdx) orderErrors.push(pageLabels[p]||p);
+      lastIdx = Math.max(lastIdx, expectedIdx);
+    });
+    const missingPages = CORRECT_ORDER.filter(p => !contractPages.includes(p));
+    if (missingPages.length > 0) add("orange", "Pages manquantes dans le dossier", "Pages absentes : " + missingPages.map(p=>pageLabels[p]).join(', ') + ".");
+    if (orderErrors.length > 0) add("orange", "Ordre des pages incorrect", "Pages mal positionnées : " + orderErrors.join(', ') + ". Ordre correct : Bon Inocrea → Bon Worldline → Bancontact → Cartes inter → Bon terminal → Services VAA.");
+  }
+
+  // ── IBAN ──
   if (!d.iban?.v || d.iban.v.trim() === "") {
     add("red", "IBAN manquant", "Le numéro IBAN est absent du contrat.");
   } else if (d.iban.c === "low") {
     add("orange", "IBAN illisible", "L'IBAN est présent mais difficile à lire. À vérifier.");
   }
+
+  // ── PEPPOL ──
   if (!d.peppol?.v || d.peppol.v.trim() === "") {
     add("orange", "Peppol ID manquant", "Le Peppol ID n'est pas renseigné dans le contrat.");
+    add("action", "Vérifier Peppol ID", "Demander au client son Peppol ID ou le retrouver sur directory.peppol.eu");
+  } else if (d._peppol_found === false) {
+    add("red", "Peppol ID : entreprise non trouvée", "L'entreprise n'est pas enregistrée sur directory.peppol.eu. Vérifier avec le client.");
+    add("action", "Vérifier inscription Peppol", "L'entreprise n'est pas dans le registre Peppol — confirmer avec le client.");
+  } else if (d.peppol?.edited) {
+    const wasVal = d.peppol._was || '(vide ou incomplet)';
+    add("orange", "Peppol ID à corriger sur le contrat", "Le contrat indique \"" + wasVal + "\" — le format correct est \"" + d.peppol.v + "\". Corriger sur le bon de commande Worldline.");
   }
+
+  // ── GSM ──
+  if (!d.gsm?.v || d.gsm.v.trim() === "") {
+    add("red", "GSM manquant", "Le numéro de GSM est obligatoire pour le contrôle UBO. Non renseigné dans le contrat.");
+    add("action", "Demander le GSM", "Le numéro de GSM est absent — le demander au client (commence par 045x/046x/047x/048x/049x).");
+  }
+
+  // ── SIGNATURE ──
   if (!d.signature_presente) {
     add("red", "Signature absente", "Le contrat ne semble pas signé par le client.");
   }
-  if (d.modele?.v === "DX8000" || (d.modele?.v && d.modele.v.includes("DX8000"))) {
-    if (!d.kit?.v || d.kit.v === "aucun") {
-      add("red", "Kit non sélectionné (DX8000)", "Pour le DX8000, le Kit Start ou Kit Pro doit impérativement être coché.");
-    }
-    if (d.dx_ref?.v === "C01615") {
-      add("red", "Référence DX incorrecte", "La référence C01615 n'est pas autorisée. Seul C01602 est valide pour le DX8000.");
-    } else if (!d.dx_ref?.v || d.dx_ref.v.trim() === "" || d.dx_ref.v === "aucun") {
-      add("orange", "Référence DX manquante", "La référence du module DX (C01602) doit être indiquée au contrat.");
-    }
-    // DX8000 sans caisse = normal (imprime les tickets directement)
+
+  // ── MODÈLE ──
+  const KNOWN_MODELS = ['RX5000','DX8000','Yomani Double Module','MarketPay PAX A8500 + Q25','MarketPay PAX A8900'];
+  if (!d.modele?.v || d.modele.v.trim() === "") {
+    add("orange", "Modèle de terminal incertain", "Le modèle de terminal n'est pas clairement identifié.");
+  } else if (!KNOWN_MODELS.includes(d.modele.v)) {
+    add("orange", "Modèle inconnu", "Le modèle \""+d.modele.v+"\" n'est pas reconnu. Vérifier le contrat.");
   }
+
+  // ── DX8000 ──
+  if (d.modele?.v === "DX8000" || (d.modele?.v && d.modele.v.includes("DX8000"))) {
+    if (!d.kit?.v || d.kit.v === "aucun") add("red", "Kit non sélectionné (DX8000)", "Pour le DX8000, le Kit Start ou Kit Pro doit être coché.");
+    if (d.dx_ref?.v === "C01615") add("red", "Référence DX incorrecte", "La référence C01615 n'est pas autorisée. Seul C01602 est valide pour le DX8000.");
+    else if (!d.dx_ref?.v || d.dx_ref.v.trim() === "" || d.dx_ref.v === "aucun") add("orange", "Référence DX manquante", "La référence du module DX (C01602) doit être indiquée au contrat.");
+  }
+
+  // ── RX5000 CAISSE ──
   if (d.modele?.v === "RX5000") {
     const cs = d.caisse_statut;
     if (cs === "manquant" || !d.caisse?.v || d.caisse.v.trim() === "") {
       add("red", "RX5000 : système de caisse manquant", "Le RX5000 nécessite un système de caisse. À renseigner obligatoirement.");
+      add("action", "Confirmer système de caisse", "Demander au client quel système de caisse il utilise et vérifier sa compatibilité Worldline.");
     } else if (cs === "reconfirmer") {
-      add("orange", "Système de caisse à reconfirmer", "\"" + (d.caisse?.v||"") + "\" ressemble à \"" + (d.caisse_suggestion||"?") + "\" — faute d'orthographe probable. À confirmer avec le client.");
+      add("orange", "Système de caisse à reconfirmer", "\"" + (d.caisse?.v||"") + "\" ressemble à \"" + (d.caisse_suggestion||"?") + "\" — faute d'orthographe probable. Corriger sur le contrat.");
+      add("action", "Confirmer nom du système de caisse", "Reconfirmer l'orthographe exacte : \"" + (d.caisse?.v||"") + "\" → probablement \"" + (d.caisse_suggestion||"?") + "\".");
     } else if (cs === "inconnu") {
-      add("orange", "Système de caisse inconnu", "\"" + (d.caisse?.v||"") + "\" n'est pas dans la liste des intégrateurs Worldline. À vérifier.");
+      add("orange", "Système de caisse inconnu", "\"" + (d.caisse?.v||"") + "\" n'est pas dans la liste des intégrateurs Worldline.");
+      add("action", "Vérifier compatibilité caisse", "\"" + (d.caisse?.v||"") + "\" non reconnu — confirmer avec le client et vérifier la liste Worldline.");
+    } else if (cs === "valide" && d.caisse?.edited) {
+      add("green", "Système de caisse corrigé", "Anomalie initiale résolue — caisse confirmée : " + (d.caisse?.v||""));
     }
   }
+
+  // ── QUANTITÉS ──
   if (d.qte_manquante_inocrea === true || (d.nb && String(d.nb?.v) === '0')) {
-    add("red", "Quantité manquante (bon Inocrea)", "Le terminal est sélectionné mais la colonne Qté est vide sur le bon de commande Inocrea. Worldline peut refuser le dossier.");
+    add("red", "Quantité manquante (bon Inocrea)", "Le terminal est sélectionné mais la colonne Qté est vide sur le bon Inocrea.");
   }
   if (d.qte_manquante_worldline === true) {
-    add("red", "Quantité manquante (bon Worldline)", "Le kit est sélectionné mais la colonne Qté est vide sur le bon de commande Worldline. Une quantité est obligatoire — Worldline refusera le dossier.");
+    add("red", "Quantité manquante (bon Worldline)", "Le kit est sélectionné mais la colonne Qté est vide sur le bon Worldline.");
   }
+  if (d.qte_illisible_worldline === true) {
+    add("orange", "Quantité illisible (bon Worldline)", "La colonne Qté semble renseignée mais n'est pas clairement lisible. Reconfirmer avec le commercial.");
+  }
+
+  // ── DURÉE MAXIMALE ──
+  const duree = parseInt(String(d.duree_mois?.v||'0').replace(/[^0-9]/g,'')) || 0;
+  const nbreLoyers = parseInt(String(d.nbre_loyers?.v||'0').replace(/[^0-9]/g,'')) || 0;
+  const dureeEffective = duree || (nbreLoyers * 3);
+  if (dureeEffective > 63 && dureeEffective > 0) {
+    add("red", "Durée invalide : " + dureeEffective + " mois", "La durée maximale autorisée est de 63 mois (21 loyers trimestriels). Ce contrat indique " + dureeEffective + " mois — retourner au commercial pour corriger la durée, le loyer HTVA, la TVA et le loyer TTC.");
+  }
+
+  // ── CONNECTIVITÉ ──
+  if (!d.connect?.v || d.connect.v.trim() === "") {
+    var connOpts = (d.modele&&d.modele.v==="RX5000") ? "WiFi ou Ethernet" : (d.modele&&d.modele.v&&d.modele.v.includes("Yomani")) ? "Ethernet" : "WiFi ou 4G";
+    add("red", "Connectivité non cochée", "La connectivité doit être indiquée au contrat ("+connOpts+").");
+  }
+
+  // ── EMAIL ──
   if (!d.email?.v || d.email.v.trim() === "") {
     add("orange", "Email client manquant", "L'adresse email n'est pas renseignée.");
+    add("action", "Demander l'email", "L'adresse email du client est absente — la demander pendant l'appel.");
   } else if (d.email.v && !d.email.v.includes("@")) {
     add("red", "Email invalide", "L'adresse email semble incorrecte : " + d.email.v);
   }
-  if (!d.connect?.v || d.connect.v.trim() === "") {
-    add("red", "Connectivité non cochée", "WiFi ou 4G doit être sélectionné dans le contrat.");
+
+  // ── BANCONTACT PAR TRANSACTION ──
+  if (d.bancontact_par_transaction === true) {
+    add("orange", "Bancontact par transaction — code 120 requis", "Les sections Bancontact BOOST et abonnement sont vides/barrées. Ajouter le code \"AlnocreaD120\" dans le champ prévu sur le bon Worldline." + (d.bancontact_tarif ? " Tarif lu : " + d.bancontact_tarif + " par transaction." : ""));
   }
-  const KNOWN_MODELS = ['RX5000','DX8000','Yomani Double Module','MarketPay PAX A8500','MarketPay PAX A8900'];
-  if (d.modele?.v && !KNOWN_MODELS.includes(d.modele.v)) {
-    add("orange", "Modèle inconnu", "Le modèle \""+d.modele.v+"\" n'est pas reconnu. Vérifier le contrat.");
+
+  // ── PAGE CHÈQUES REPAS ──
+  if (d.page_cr_absente === true) {
+    add("orange", "Page Services à valeur ajoutée absente", "La page 'Services à valeur ajoutée' (Backup mode, DCC, Chèques repas) n'est pas dans le dossier. Le commercial doit la fournir.");
+    add("action", "Confirmer services additionnels", "La page Services à valeur ajoutée est absente — demander au client s'il souhaite Backup mode, DCC ou chèques repas.");
   }
-  if (!d.modele?.v || d.modele.v.trim() === "") {
-    add("orange", "Modèle de terminal incertain", "Le modèle de terminal n'est pas clairement identifié.");
-  }
-  if (d.modele?.v && (d.modele.v === 'MarketPay PAX A8500' || d.modele.v === 'MarketPay PAX A8900')) {
-    if (!d.abonnement?.v || d.abonnement.v.trim() === '') {
-      add("orange", "Abonnement MarketPay non renseigné", "Le plan d'abonnement (INO-Mobile, INO-Basic, INO-Max) doit être coché sur le contrat.");
-    }
+
+  // ── MarketPay ──
+  if (d.modele?.v && (d.modele.v === 'MarketPay PAX A8500 + Q25' || d.modele.v === 'MarketPay PAX A8900')) {
+    if (!d.abonnement?.v || d.abonnement.v.trim() === '') add("orange", "Abonnement MarketPay non renseigné", "Le plan d'abonnement (INO-Mobile, INO-Basic, INO-Max) doit être coché.");
     if (d.svc_cr === "oui") add("red", "MarketPay: chèques-repas incompatibles", "Le MarketPay ne supporte pas les chèques-repas.");
     if (d.svc_ores === "oui") add("red", "MarketPay: ORES incompatible", "Le MarketPay ne supporte pas ORES.");
     if (d.svc_barra === "oui") add("red", "MarketPay: Barracuda incompatible", "Le MarketPay ne supporte pas Barracuda.");
     if (d.svc_eid === "oui") add("red", "MarketPay: Lecteur ID incompatible", "Le MarketPay ne supporte pas le lecteur ID.");
     if (d.svc_pad === "oui") add("red", "MarketPay: Paiement distance incompatible", "Le MarketPay ne supporte pas le paiement à distance.");
   }
-  var isDXorRX = d.modele?.v === "DX8000" || d.modele?.v === "RX5000";
-  var isYDM_an = d.modele?.v === "Yomani Double Module";
-  if (isDXorRX) {
-    if (d.svc_ores === "oui") add("red", "ORES non disponible sur ce terminal", "ORES n'est disponible que sur le Yomani Double Module.");
-    if (d.svc_barra === "oui") add("red", "Barracuda non disponible sur ce terminal", "Barracuda n'est disponible que sur le Yomani Double Module.");
-    if (d.svc_eid === "oui") add("red", "Lecteur ID non disponible sur ce terminal", "Le lecteur ID n'est disponible que sur le Yomani Double Module.");
+
+  // ── Services DX/RX ──
+  if (d.modele?.v === "DX8000" || d.modele?.v === "RX5000") {
+    if (d.svc_ores === "oui") add("red", "ORES non disponible", "ORES n'est disponible que sur le Yomani Double Module.");
+    if (d.svc_barra === "oui") add("red", "Barracuda non disponible", "Barracuda n'est disponible que sur le Yomani Double Module.");
+    if (d.svc_eid === "oui") add("red", "Lecteur ID non disponible", "Le lecteur ID n'est disponible que sur le Yomani Double Module.");
   }
+
+  // ── BCE / SOCIÉTÉ ──
   if (!d.bce?.v || d.bce.v.trim() === "") {
     add("orange", "Numéro BCE / TVA manquant", "Le numéro d'entreprise n'est pas renseigné.");
+  } else if (d.bce?.edited) {
+    add("green", "BCE / TVA corrigé", "Information complétée/corrigée : " + d.bce.v);
   }
   if (!d.societe?.v || d.societe.v.trim() === "") {
     add("red", "Nom société manquant", "Le nom de la société n'est pas lisible dans le contrat.");
+  } else if (d.societe?.edited) {
+    add("green", "Nom société corrigé", "Information corrigée : " + d.societe.v);
   }
+
+  // ── ADRESSE ILLISIBLE ──
+  if (d.adresse_livraison?.c === "low") {
+    add("action", "Reconfirmer adresse de livraison", "L'adresse de livraison est peu lisible — reconfirmer avec le client.");
+  }
+
+  // ── RIB ──
   if (d.doc_rib_present === false) {
     add("red", "RIB manquant", "Aucun RIB trouvé. Document obligatoire.");
   } else if (d.doc_rib_present === true) {
     if (!d.doc_rib_banque) add("orange", "RIB: banque non visible", "Le nom de la banque doit apparaître sur le document.");
     if (d.doc_rib_iban_match === false) add("red", "RIB: IBAN ne correspond pas", "L'IBAN du RIB ne correspond pas au contrat.");
-    if (d.doc_rib_ok) add("green", "RIB conforme", "Banque et société visibles, IBAN vérifié.");
+    if (d.doc_rib_ok) add("green", "RIB conforme", "Banque " + (d.doc_rib_banque||"") + ", société " + (d.doc_rib_societe||"") + ", IBAN vérifié.");
   }
+
+  // ── CI ──
   if (d.doc_ci_recto === false) add("red", "Carte d'identité recto manquante", "La carte d'identité recto est absente.");
   if (d.doc_ci_verso === false) add("red", "Carte d'identité verso manquante", "La carte d'identité verso est absente.");
   if (d.doc_ci_couleur === false) add("red", "Carte d'identité en noir et blanc", "La carte d'identité doit être en couleur.");
-  if (d.doc_ci_valide === false) add("red", "Carte d'identité expirée", "Document expiré. Le client doit fournir une carte valide.");
-  if (d.doc_ci_qualite === "low") add("orange", "Carte d'identité: qualité insuffisante", "Photo floue ou illisible.");
+  if (d.doc_ci_valide === false && (d.doc_ci_recto || d.doc_ci_verso)) add("red", "Carte d'identité expirée", "Document expiré. Le client doit fournir une carte valide.");
+  if (d.doc_ci_qualite === "low" && (d.doc_ci_recto || d.doc_ci_verso)) add("orange", "Carte d'identité: qualité insuffisante", "Photo floue ou illisible.");
   if (d.doc_ci_recto && d.doc_ci_verso && d.doc_ci_couleur && d.doc_ci_valide && d.doc_ci_qualite !== "low") {
     add("green", "Carte d'identité conforme", "Recto/verso couleur, valide jusqu'au " + (d.doc_ci_validite||"?"));
   }
+
   return an;
 }
 
@@ -972,7 +1134,8 @@ function renderAnalysis() {
   };
   const conf = (key) => D[key]?.c || 'low';
   const badge = (key) => {
-    const c = conf(key);
+    const obj = D[key];
+    const c = (obj?.edited && obj?.c === 'med') ? 'low' : (conf(key));
     const lbl = c==='high'?'✓':c==='med'?'?':'✗';
     const col = c==='high'?'var(--green)':c==='med'?'var(--orange)':'var(--red)';
     const bg  = c==='high'?'var(--green-lt)':c==='med'?'var(--orange-lt)':'var(--red-lt)';
@@ -1043,7 +1206,8 @@ function renderAnalysis() {
   };
 
   // Separate anomalies from green
-  const contractAnom = ANOMALIES.filter(a => a.sev!=='green');
+  const contractAnom = ANOMALIES.filter(a => a.sev==='red' || a.sev==='orange');
+  const actionItems = ANOMALIES.filter(a => a.sev==='action');
   const docOK = ANOMALIES.filter(a => a.sev==='green');
   const _mod = g('modele');
   const isDX = _mod.includes('DX8000');
@@ -1051,13 +1215,20 @@ function renderAnalysis() {
   const isMP = _mod.startsWith('MarketPay');
 
   const anomHtml = contractAnom.length === 0
-    ? '<div style="padding:8px;font-size:13px;color:var(--green);font-weight:600">Aucun problème détecté.</div>'
+    ? '<div style="padding:8px;font-size:13px;color:var(--green);font-weight:600">✅ Aucune anomalie sur le contrat.</div>'
     : contractAnom.map(a =>
         '<div style="display:flex;gap:8px;padding:8px 10px;border-radius:6px;margin-bottom:5px;background:'+(a.sev==='red'?'var(--red-lt)':'var(--orange-lt)')+';border-left:3px solid '+(a.sev==='red'?'var(--red)':'var(--orange)')+'">'+
         '<span>'+(a.sev==='red'?'🚫':'⚠️')+'</span>'+
         '<div><div style="font-size:12px;font-weight:700;color:'+(a.sev==='red'?'var(--red)':'var(--orange)')+'">'+a.title+'</div>'+
         '<div style="font-size:11px;color:var(--muted)">'+a.desc+'</div></div></div>'
       ).join('');
+
+  const actionHtml = actionItems.length === 0 ? '' : actionItems.map(a =>
+    '<div style="display:flex;gap:8px;padding:8px 10px;border-radius:6px;margin-bottom:5px;background:#EFF6FF;border-left:3px solid #3B82F6">'+
+    '<span>📋</span>'+
+    '<div><div style="font-size:12px;font-weight:700;color:#1D4ED8">'+a.title+'</div>'+
+    '<div style="font-size:11px;color:var(--muted)">'+a.desc+'</div></div></div>'
+  ).join('');
 
   const docBadgeHtml = (label, present, ok, details) => {
     const cls = present===false?'red':ok?'green':'orange';
@@ -1110,7 +1281,8 @@ function renderAnalysis() {
             ${row('Adresse facturation','adresse_facturation')}
             ${row('Adresse livraison','adresse_livraison')}
             ${row('Email','email')}
-            ${row('Tél / GSM','tel')}
+            ${row('Téléphone fixe','tel')}
+            ${row('GSM','gsm')}
             ${row('Contact','contact')}
             ${row('Peppol ID','peppol')}
             ${row('IBAN','iban')}
@@ -1172,10 +1344,18 @@ function renderAnalysis() {
 
       <div class="section-card" style="grid-column:1/-1">
         <div class="sc-head" id="anomaliesHead" style="${contractAnom.length?'background:var(--orange);color:#fff':''}">
-          ${contractAnom.length?'⚠️ Anomalies à corriger':'✅ Aucune anomalie'}
+          ${contractAnom.length?'⚠️ Anomalies à corriger sur le contrat':'✅ Aucune anomalie sur le contrat'}
         </div>
         <div class="sc-body" style="padding:8px" id="anomaliesBox">${anomHtml}</div>
       </div>
+
+      ${actionItems.length ? `
+      <div class="section-card" style="grid-column:1/-1">
+        <div class="sc-head" style="background:#1D4ED8;color:#fff">
+          📋 Actions à confirmer avec le client
+        </div>
+        <div class="sc-body" style="padding:8px" id="actionsBox">${actionHtml}</div>
+      </div>` : ''}
 
       <div class="section-card" style="grid-column:1/-1">
         <div class="sc-head">✅ Documents vérifiés</div>
@@ -1243,7 +1423,7 @@ function validateEdit(key) {
   if (disp) disp.textContent = val || 'Non renseigné';
   const row = document.getElementById('erow_'+key);
   if (row) row.style.display = 'none';
-  const labels = {societe:'Société',bce:'BCE/TVA',adresse_facturation:'Adresse facturation',adresse_livraison:'Adresse livraison',email:'Email',tel:'Téléphone',
+  const labels = {societe:'Société',bce:'BCE/TVA',adresse_facturation:'Adresse facturation',adresse_livraison:'Adresse livraison',email:'Email',tel:'Tél fixe',gsm:'GSM',
     contact:'Contact',peppol:'Peppol',iban:'IBAN',commercial:'Commercial',caisse:'Caisse',
     loyer_ttc:'Loyer',duree_mois:'Durée',nbre_loyers:'Nb loyers'};
   const msg = 'Corriger '+(labels[key]||key)+' : '+val;
@@ -1297,28 +1477,41 @@ function refreshAnomalies() {
   ANOMALIES = detectAnomalies(D);
   const redCount = ANOMALIES.filter(a=>a.sev==='red').length;
   const orangeCount = ANOMALIES.filter(a=>a.sev==='orange').length;
-  const contractAnom = ANOMALIES.filter(a=>a.sev!=='green');
+  const contractAnom = ANOMALIES.filter(a=>a.sev==='red'||a.sev==='orange');
+  const actionItems = ANOMALIES.filter(a=>a.sev==='action');
+
   const anomHtml = contractAnom.length===0
-    ? '<div style="padding:8px;font-size:13px;color:var(--green);font-weight:600">Aucun problème détecté.</div>'
+    ? '<div style="padding:8px;font-size:13px;color:var(--green);font-weight:600">✅ Aucune anomalie sur le contrat.</div>'
     : contractAnom.map(a=>
         '<div style="display:flex;gap:8px;padding:8px 10px;border-radius:6px;margin-bottom:5px;background:'+(a.sev==='red'?'var(--red-lt)':'var(--orange-lt)')+';border-left:3px solid '+(a.sev==='red'?'var(--red)':'var(--orange)')+'">'+
         '<span>'+(a.sev==='red'?'🚫':'⚠️')+'</span>'+
         '<div><div style="font-size:12px;font-weight:700;color:'+(a.sev==='red'?'var(--red)':'var(--orange)')+'">'+a.title+'</div>'+
         '<div style="font-size:11px;color:var(--muted)">'+a.desc+'</div></div></div>'
       ).join('');
+
+  const actionHtml = actionItems.map(a=>
+    '<div style="display:flex;gap:8px;padding:8px 10px;border-radius:6px;margin-bottom:5px;background:#EFF6FF;border-left:3px solid #3B82F6">'+
+    '<span>📋</span>'+
+    '<div><div style="font-size:12px;font-weight:700;color:#1D4ED8">'+a.title+'</div>'+
+    '<div style="font-size:11px;color:var(--muted)">'+a.desc+'</div></div></div>'
+  ).join('');
+
   const anomBox = document.getElementById('anomaliesBox');
-  if (anomBox) { anomBox.innerHTML = anomHtml; }
+  if (anomBox) anomBox.innerHTML = anomHtml;
+  const actionsBox = document.getElementById('actionsBox');
+  if (actionsBox) actionsBox.innerHTML = actionHtml;
   const head = document.getElementById('anomaliesHead');
   if (head) {
     head.style.background = contractAnom.length?'var(--orange)':'';
     head.style.color = contractAnom.length?'#fff':'';
-    head.textContent = contractAnom.length?'⚠️ Anomalies à corriger':'✅ Aucune anomalie';
+    head.textContent = contractAnom.length?'⚠️ Anomalies à corriger sur le contrat':'✅ Aucune anomalie sur le contrat';
   }
   const ctr = document.getElementById('anomCounters');
   if (ctr) {
     ctr.innerHTML =
       (redCount>0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:var(--red-lt);color:var(--red);border:1px solid var(--red-bd)">🚫 '+redCount+' bloquant'+(redCount>1?'s':'')+'</div>':'')+
       (orangeCount>0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:var(--orange-lt);color:var(--orange);border:1px solid var(--orange-bd)">⚠️ '+orangeCount+' à vérifier</div>':'')+
+      (actionItems.length>0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:#EFF6FF;color:#1D4ED8;border:1px solid #BFDBFE">📋 '+actionItems.length+' action'+(actionItems.length>1?'s':'')+' à confirmer</div>':'')+
       (redCount===0&&orangeCount===0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:var(--green-lt);color:var(--green);border:1px solid var(--green-bd)">✅ Conforme</div>':'');
   }
 }
@@ -1329,7 +1522,7 @@ function markEditKey(inp) {
   if (!D[key]) D[key] = {v:'',c:'high'};
   D[key].v = val;
   D[key].edited = true;
-  const labels = {societe:'Société',bce:'BCE/TVA',adresse_facturation:'Adresse facturation',adresse_livraison:'Adresse livraison',email:'Email',tel:'Téléphone',
+  const labels = {societe:'Société',bce:'BCE/TVA',adresse_facturation:'Adresse facturation',adresse_livraison:'Adresse livraison',email:'Email',tel:'Tél fixe',gsm:'GSM',
     modele:'Modèle',connect:'Connectivité',nb:'Nb terminaux',kit:'Kit',caisse:'Caisse',
     dx_ref:'Réf DX',location_type:'Location',loyer_ttc:'Loyer',duree_mois:'Durée',commercial:'Commercial'};
   const msg = 'Corriger '+(labels[key]||key)+' : '+val;
@@ -1495,8 +1688,8 @@ function buildTrame() {
   );
 
       // ── SECTION 2 : INFOS CLIENT (modifiables inline) ───────────────────────
-  var infoKeys = ['societe','bce','adresse_facturation','adresse_livraison','email','tel'];
-  var infoLabels = {societe:'Société',bce:'BCE / TVA',adresse_facturation:'Adresse facturation',adresse_livraison:'Adresse livraison',email:'Email',tel:'Téléphone'};
+  var infoKeys = ['societe','bce','adresse_facturation','adresse_livraison','email','tel','gsm'];
+  var infoLabels = {societe:'Société',bce:'BCE / TVA',adresse_facturation:'Adresse facturation',adresse_livraison:'Adresse livraison',email:'Email',tel:'Tél fixe',gsm:'GSM'};
   var infoRows = infoKeys.map(function(k){
     var val = String(D[k]&&D[k].v?D[k].v:'—');
     return '<tr style="border-bottom:1px solid rgba(255,255,255,.08)">'+
@@ -2500,7 +2693,7 @@ function trameEditUpdate(el, key) {
   if(!D[key]) D[key] = {v:'',c:'high'};
   D[key].v = val;
   D[key].edited = true;
-  const labels = {societe:'Société',bce:'BCE/TVA',adresse_facturation:'Adresse facturation',adresse_livraison:'Adresse livraison',email:'Email',tel:'Téléphone'};
+  const labels = {societe:'Société',bce:'BCE/TVA',adresse_facturation:'Adresse facturation',adresse_livraison:'Adresse livraison',email:'Email',tel:'Tél fixe',gsm:'GSM'};
   const msg = 'Corriger '+labels[key]+' → '+val;
   const idx2 = ACTIONS.findIndex(function(a){ return a.msg && a.msg.startsWith('Corriger '+labels[key]); });
   if(idx2>=0) ACTIONS[idx2].msg=msg; else addAction('o',msg);
@@ -2904,7 +3097,8 @@ function buildRecap() {
       row2('Adresse facturation','adresse_facturation')+
       row2('Adresse livraison','adresse_livraison')+
       row2('Email','email')+
-      row2('Téléphone','tel')+
+      row2('Téléphone fixe','tel')+
+      row2('GSM','gsm')+
       row2('Contact','contact')+
       row2('Peppol ID','peppol')+
       row2('IBAN','iban')+
@@ -2980,6 +3174,7 @@ function goNext() {
     document.getElementById('step2').style.display='none';
     document.getElementById('step3').style.display='block';
     buildRecap();
+    saveAnalysisToKV('email');
     document.getElementById('stp1').className='step done';
     document.getElementById('stp2').className='step active';
     var _n=document.getElementById('btnNext'); if(_n) _n.classList.add('hidden');
@@ -3029,6 +3224,38 @@ function goBack() {
 // ============================================================
 // PDF GENERATION
 // ============================================================
+// ============================================================
+// SAUVEGARDE KV — Dashboard analytics
+// ============================================================
+async function saveAnalysisToKV(source) {
+  try {
+    const redCount = ANOMALIES.filter(a=>a.sev==='red').length;
+    const orangeCount = ANOMALIES.filter(a=>a.sev==='orange').length;
+    const statut = redCount > 0 ? 'bloquant' : orangeCount > 0 ? 'a_corriger' : 'conforme';
+    const payload = {
+      source: source || 'email',
+      commercial: D.commercial?.v || '',
+      societe: D.societe?.v || '',
+      bce: D.bce?.v || '',
+      modele: D.modele?.v || '',
+      location_type: D.location_type?.v || '',
+      duree_mois: D.duree_mois?.v || '',
+      anomalies: ANOMALIES.filter(a=>a.sev==='red'||a.sev==='orange').map(a=>({sev:a.sev,title:a.title})),
+      actions: ANOMALIES.filter(a=>a.sev==='action').map(a=>({title:a.title})),
+      statut,
+      nb_red: redCount,
+      nb_orange: orangeCount,
+    };
+    await fetch('https://quiet-bonus-454e.olivierdubost.workers.dev/save-analysis', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+  } catch(e) {
+    console.warn('KV save failed (non-bloquant):', e.message);
+  }
+}
+
 function genPDF() {
   const {jsPDF}=window.jspdf;
   const doc=new jsPDF({orientation:'portrait',unit:'mm',format:'a4'});
@@ -3057,7 +3284,7 @@ function genPDF() {
   sec('IDENTIFICATION');
   row('Societe',g('societe'));row('BCE / TVA',g('bce'));
   row('Adresse facturation',g('adresse_facturation'));row('Adresse livraison',g('adresse_livraison'));
-  row('Email',g('email'));row('Tel',g('tel'));row('Peppol ID',g('peppol'));row('IBAN',g('iban'));
+  row('Email',g('email'));row('Tel fixe',g('tel'));row('GSM',g('gsm'));row('Peppol ID',g('peppol'));row('IBAN',g('iban'));
   if(corr('corr_soc')) row('Societe CORR.',corr('corr_soc'),true);
   if(corr('corr_bce')) row('BCE CORR.',corr('corr_bce'),true);
   if(corr('corr_adr')) row('Adresse CORR.',corr('corr_adr'),true);
@@ -3277,6 +3504,7 @@ function buildEmailContent() {
     [t.adresse, (D.adresse_facturation&&D.adresse_facturation.v)||''],
     [t.email_label, emailTo],
     [t.tel, (D.tel&&D.tel.v)||''],
+    ['GSM', (D.gsm&&D.gsm.v)||''],
     ['IBAN', (D.iban&&D.iban.v)||'']
   ].filter(function(f){ return f[1]; });
 
