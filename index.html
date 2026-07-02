@@ -709,7 +709,6 @@ function startAnalysis(file) {
 
       ANOMALIES = detectAnomalies(result);
       renderAnalysis();
-      saveAnalysisToKV('email'); // Sauvegarde dès la fin de l'analyse
     } catch(err) {
       console.error(err);
       renderAnalysisError(err.message);
@@ -1399,6 +1398,7 @@ function renderAnalysis() {
             ${row('Acquisition','location_type')}
             ${row('Loyer TTC','loyer_ttc')}
             ${row('Durée','duree_mois')}
+            ${row('Date de signature','date_signature')}
             ${isMP ? row('Abonnement','abonnement') : ''}
           </table>
         </div>
@@ -1470,17 +1470,57 @@ function renderAnalysis() {
   if (existBtn) existBtn.remove();
   const btnDiv = document.createElement('div');
   btnDiv.id = '_bottomBtns';
-  btnDiv.style.cssText = 'padding:20px 0 8px;display:flex;justify-content:space-between;align-items:center';
+  btnDiv.style.cssText = 'padding:20px 0 8px';
+
+  // Bouton Controle effectue
+  const btnControle = document.createElement('button');
+  btnControle.id = 'btnControle';
+  btnControle.textContent = '\u2705 Contr\u00f4le effectu\u00e9 \u2014 Envoyer vers le dashboard';
+  btnControle.style.cssText = 'width:100%;background:#16A34A;color:#fff;border:none;padding:13px 28px;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer;font-family:inherit;margin-bottom:10px';
+  btnControle.onclick = async function() {
+    const bce = D.bce?.v || '';
+    const dateSig = D.date_signature?.v || '';
+    const soc = D.societe?.v || '';
+
+    if (!bce || !dateSig) {
+      showDuplicatePopup('missing', soc, bce, dateSig, 'email');
+      return;
+    }
+
+    try {
+      const resp = await fetch('https://quiet-bonus-454e.olivierdubost.workers.dev/check-duplicate?bce=' + encodeURIComponent(bce) + '&date_sig=' + encodeURIComponent(dateSig));
+      const result = await resp.json();
+      if (result.duplicate) {
+        showDuplicatePopup('duplicate', soc, bce, dateSig, 'email');
+        return;
+      }
+    } catch(e) {
+      console.warn('Check doublon failed:', e.message);
+    }
+
+    doControleValide('email');
+  };
+
+  const rowBtns = document.createElement('div');
+  rowBtns.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:10px';
+
   const btnRetour = document.createElement('button');
   btnRetour.onclick = function(){ resetUploadScreen(); D={}; ANOMALIES=[]; ACTIONS=[]; const bb=document.getElementById('btnBack'); if(bb) bb.style.display='none'; };
-  btnRetour.textContent = '← Retour';
+  btnRetour.textContent = '\u2190 Retour';
   btnRetour.style.cssText = 'background:var(--surface);color:var(--muted);border:1.5px solid var(--border);padding:12px 22px;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit';
+
   const btnStart = document.createElement('button');
+  btnStart.id = '_btnStart';
   btnStart.onclick = goNext;
-  btnStart.textContent = 'Démarrer l’appel →';
-  btnStart.style.cssText = 'background:var(--blue);color:#fff;border:none;padding:12px 28px;border-radius:8px;font-size:15px;font-weight:700;cursor:pointer;font-family:inherit';
-  btnDiv.appendChild(btnRetour);
-  btnDiv.appendChild(btnStart);
+  btnStart.textContent = 'D\u00e9marrer l\'appel \u2192';
+  btnStart.disabled = true;
+  btnStart.title = 'Cliquez d\'abord sur Contr\u00f4le effectu\u00e9';
+  btnStart.style.cssText = 'background:#94A3B8;color:#fff;border:none;padding:12px 28px;border-radius:8px;font-size:15px;font-weight:700;cursor:not-allowed;font-family:inherit;opacity:.6';
+
+  rowBtns.appendChild(btnRetour);
+  rowBtns.appendChild(btnStart);
+  btnDiv.appendChild(btnControle);
+  btnDiv.appendChild(rowBtns);
   step1el.appendChild(btnDiv);
   const bb = document.getElementById('btnBack');
   if (bb) bb.style.display = 'none';
@@ -3301,6 +3341,94 @@ function goBack() {
 // ============================================================
 // PDF GENERATION
 // ============================================================
+// ============================================================
+// CONTROLE EFFECTUE — Doublon check + popup
+// ============================================================
+function doControleValide(source) {
+  const btnControle = document.getElementById('btnControle');
+  if (btnControle) {
+    btnControle.textContent = '✅ Contrôle validé — données envoyées';
+    btnControle.style.background = '#15803D';
+    btnControle.style.cursor = 'not-allowed';
+    btnControle.disabled = true;
+  }
+  saveAnalysisToKV(source);
+  activateBtnStart();
+}
+
+function activateBtnStart() {
+  const bs = document.getElementById('_btnStart');
+  if (bs) {
+    bs.disabled = false;
+    bs.style.opacity = '1';
+    bs.style.cursor = 'pointer';
+    bs.style.background = 'var(--blue)';
+  }
+}
+
+function showDuplicatePopup(type, soc, bce, dateSig, source) {
+  const old = document.getElementById('dupPopup');
+  if (old) old.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'dupPopup';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px';
+
+  let title, icon, msg, btnLabel1, btnAction1, btnLabel2, btnAction2;
+
+  if (type === 'duplicate') {
+    icon = '📋';
+    title = 'Dossier déjà envoyé au dashboard';
+    msg = `Ce dossier a déjà été enregistré dans le dashboard.<br><br>
+      <strong>Société :</strong> ${(soc||'—').toUpperCase()}<br>
+      <strong>BCE :</strong> ${bce || '—'}<br>
+      <strong>Date de signature :</strong> ${dateSig || '—'}<br><br>
+      Vous pouvez continuer directement vers l'appel client sans ré-envoyer les données.`;
+    btnLabel1 = 'Continuer vers l\'appel →';
+    btnAction1 = function() {
+      overlay.remove();
+      const bc = document.getElementById('btnControle');
+      if (bc) {
+        bc.textContent = '✅ Dossier déjà enregistré — continuer';
+        bc.style.background = '#15803D';
+        bc.style.cursor = 'not-allowed';
+        bc.disabled = true;
+      }
+      activateBtnStart();
+    };
+    btnLabel2 = 'Annuler';
+    btnAction2 = function() { overlay.remove(); };
+  } else {
+    icon = '⚠️';
+    title = 'Données incomplètes';
+    msg = `Le <strong>numéro BCE</strong> ou la <strong>date de signature</strong> est manquant.<br><br>
+      Impossible de vérifier les doublons sans ces deux informations.<br>
+      Veuillez corriger ces champs avant de continuer.`;
+    btnLabel1 = 'OK — Je corrige';
+    btnAction1 = function() { overlay.remove(); };
+    btnLabel2 = null;
+  }
+
+  const bgBtn1 = type === 'duplicate' ? '#2563EB' : '#D97706';
+
+  overlay.innerHTML = `
+    <div style="background:#fff;border-radius:14px;max-width:480px;width:100%;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.3)">
+      <div style="background:${type==='duplicate'?'#1A3A6B':'#D97706'};color:#fff;padding:18px 22px;display:flex;justify-content:space-between;align-items:center">
+        <div style="font-size:15px;font-weight:700">${icon} ${title}</div>
+        <span onclick="document.getElementById('dupPopup').remove()" style="cursor:pointer;font-size:22px;line-height:1">×</span>
+      </div>
+      <div style="padding:22px 24px;font-size:13.5px;line-height:1.7;color:#334155">${msg}</div>
+      <div style="padding:14px 22px 20px;display:flex;gap:10px;justify-content:flex-end;border-top:1px solid #E2E8F0">
+        ${btnLabel2 ? `<button id="_dupBtn2" style="background:#F1F5F9;color:#64748B;border:1.5px solid #E2E8F0;padding:10px 18px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit">${btnLabel2}</button>` : ''}
+        <button id="_dupBtn1" style="background:${bgBtn1};color:#fff;border:none;padding:10px 22px;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit">${btnLabel1}</button>
+      </div>
+    </div>`;
+
+  document.body.appendChild(overlay);
+  document.getElementById('_dupBtn1').onclick = btnAction1;
+  if (btnLabel2) document.getElementById('_dupBtn2').onclick = btnAction2;
+}
+
 // ============================================================
 // SAUVEGARDE KV — Dashboard analytics
 // ============================================================
