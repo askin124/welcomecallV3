@@ -546,10 +546,7 @@ function handleDrop(e) {
   const files = Array.from(e.dataTransfer.files);
   if (files.length) loadFiles(files);
 }
-function handleFile(e) {
-  const files = Array.from(e.target.files);
-  if (files.length) loadFiles(files);
-}
+// handleFile est défini plus bas — doublon supprimé ici.
 
 
 function loadFiles(files) {
@@ -654,10 +651,58 @@ function startAnalysis(file) {
       await new Promise(r => setTimeout(r, 300));
       D = result;
 
+      // ── Normalisation BCE → BE + 10 chiffres ──
+      if (D.bce?.v) {
+        const bceDigits = D.bce.v.replace(/[^0-9]/g,'');
+        if (bceDigits.length >= 9) {
+          D.bce.v = 'BE' + bceDigits.slice(-10).padStart(10,'0');
+        }
+      }
+
+      // ── Formatage GSM belge → 04XX XX XX XX ──
+      function formatBelgianPhone(num) {
+        const d = num.replace(/[^0-9]/g,'');
+        if (d.startsWith('04') && d.length === 10) {
+          return d.slice(0,4)+' '+d.slice(4,6)+' '+d.slice(6,8)+' '+d.slice(8,10);
+        }
+        if (!d.startsWith('04') && d.length === 9) {
+          // Fixe : 0X XXX XX XX ou 0XX XX XX XX
+          if (/^0[23456789]/.test(d)) {
+            return d.slice(0,2)+' '+d.slice(2,5)+' '+d.slice(5,7)+' '+d.slice(7,9);
+          }
+          return d.slice(0,3)+' '+d.slice(3,5)+' '+d.slice(5,7)+' '+d.slice(7,9);
+        }
+        return num; // retourner tel quel si format inconnu
+      }
+      if (D.gsm?.v) D.gsm.v = formatBelgianPhone(D.gsm.v);
+      if (D.tel?.v) D.tel.v = formatBelgianPhone(D.tel.v);
+
+      // ── Correction page_cr_absente ──
+      if (Array.isArray(D.pages_ordre) && D.pages_ordre.includes('services_vaa')) {
+        D.page_cr_absente = false;
+      }
+
+      // ── Détecter si contrat MarketPay ──
+      const _isMP = (D.modele?.v && (D.modele.v.includes('MarketPay') || D.modele.v.includes('A8500') || D.modele.v.includes('A8900'))) ||
+        (Array.isArray(D.pages_ordre) && (D.pages_ordre.includes('bon_inocrea_mp') || D.pages_ordre.includes('formulaire_mp') || D.pages_ordre.includes('ubo')));
+      if (_isMP) {
+        D._is_marketpay = true;
+        D.page_cr_absente = false;
+      }
+
+      // ── Marquer durée en rouge si > 63 mois ──
+      const _duree = parseInt(String(D.duree_mois?.v||'0').replace(/[^0-9]/g,'')) || 0;
+      const _loyers = parseInt(String(D.nbre_loyers?.v||'0').replace(/[^0-9]/g,'')) || 0;
+      const _dureeEff = _duree || (_loyers * 3);
+      if (_dureeEff > 63 && _dureeEff > 0) {
+        if (D.duree_mois) D.duree_mois.c = 'low';
+        if (D.nbre_loyers) D.nbre_loyers.c = 'low';
+      }
+
       // ── Séparer tel/gsm si l'IA n'a pas séparé ──
       if (D.tel?.v && !D.gsm?.v) {
         const num = D.tel.v.replace(/\s/g,'');
-        if (/^04[5-9]/.test(num)) {
+        if (/^04[5-9]/.test(num) || /^047/.test(num) || /^046/.test(num) || /^048/.test(num) || /^049/.test(num)) {
           D.gsm = {v: D.tel.v, c: D.tel.c};
           D.tel = {v: '', c: 'low'};
         }
@@ -685,29 +730,32 @@ function startAnalysis(file) {
         } catch(e) {}
       }
 
-      // ── Correction page_cr_absente : si services_vaa détecté, forcer false ──
-      if (Array.isArray(D.pages_ordre) && D.pages_ordre.includes('services_vaa')) {
-        D.page_cr_absente = false;
-      }
-
-      // ── Détecter si contrat MarketPay ──
-      const _isMP = (D.modele?.v && (D.modele.v.includes('MarketPay') || D.modele.v.includes('A8500') || D.modele.v.includes('A8900'))) ||
-        (Array.isArray(D.pages_ordre) && (D.pages_ordre.includes('bon_inocrea_mp') || D.pages_ordre.includes('formulaire_mp') || D.pages_ordre.includes('ubo')));
-      if (_isMP) {
-        D._is_marketpay = true;
-        D.page_cr_absente = false;
-      }
-
-      // ── Marquer durée en rouge si > 63 mois ──
-      const _duree = parseInt(String(D.duree_mois?.v||'0').replace(/[^0-9]/g,'')) || 0;
-      const _loyers = parseInt(String(D.nbre_loyers?.v||'0').replace(/[^0-9]/g,'')) || 0;
-      const _dureeEff = _duree || (_loyers * 3);
-      if (_dureeEff > 63 && _dureeEff > 0) {
-        if (D.duree_mois) D.duree_mois.c = 'low';
-        if (D.nbre_loyers) D.nbre_loyers.c = 'low';
+      // ── Vérification IBAN via openiban.com ──
+      if (D.iban?.v) {
+        const ibanClean = D.iban.v.replace(/[\s\-]/g,'').toUpperCase();
+        try {
+          const ibanResp = await fetch('https://openiban.com/validate/' + ibanClean + '?getBIC=true&validateBankCode=true');
+          if (ibanResp.ok) {
+            const ibanData = await ibanResp.json();
+            if (ibanData.valid === false) {
+              D.iban.c = 'low';
+              D._iban_invalid = true;
+              D._iban_messages = ibanData.messages || [];
+            } else if (ibanData.valid === true) {
+              D._iban_bic = ibanData.bankData?.bic || '';
+              D._iban_bank = ibanData.bankData?.name || '';
+              D._iban_zip = ibanData.bankData?.zip || '';
+              D._iban_city = ibanData.bankData?.city || '';
+              D._iban_normalized = ibanData.iban || ibanClean;
+              D._iban_invalid = false;
+            }
+          }
+        } catch(e) {}
       }
 
       ANOMALIES = detectAnomalies(result);
+      // Snapshot brut IA — avant toute modification manuelle, jamais réécrit ensuite
+      try { window.D_RAW = JSON.parse(JSON.stringify(D)); } catch(e) { window.D_RAW = {}; }
       renderAnalysis();
     } catch(err) {
       console.error(err);
@@ -779,11 +827,13 @@ Page avec double logo Inocrea + Worldline en haut.
 - Extrais : societe, bce, email, contact, peppol, iban, commercial, date_signature, civilite
 - tel : numéro de téléphone FIXE uniquement (commence par 02, 03, 04 hors mobile, 050-089).
 - gsm : numéro de téléphone MOBILE uniquement. En Belgique, les GSM commencent par 045x, 046x, 047x, 048x ou 049x. Si un seul numéro commence par 04x → mettre dans gsm, laisser tel vide.
+  ATTENTION : tel et gsm doivent provenir UNIQUEMENT des champs du CLIENT ("Personne de Contact" sur le bon Inocrea, "Informations de facturation" sur le bon Worldline). Ne jamais extraire un numéro depuis la section "Informations du vendeur" / "Sales Agent" (c'est le téléphone du commercial Inocrea, pas celui du client) — l'ignorer complètement, même s'il commence par 04.
 - peppol : extraire tel quel du contrat.
 - adresse_facturation : champ "Siège social" (bon Inocrea) ou "Informations de facturation" (bon Worldline).
-- adresse_livraison : champ "Adresse livraison". Si "idem" ou guillemets → copie de adresse_facturation (confiance "med").
+- adresse_livraison : champ "Adresse livraison". Si "idem" ou guillemets → copie de adresse_facturation (confiance "high", car "idem" est une instruction explicite et non ambiguë).
 - modele : "RX5000" si ligne RX5000 cochée/montant renseigné, "DX8000" si ligne DX8000, "Yomani Double Module", "MarketPay PAX A8500 + Q25", "MarketPay PAX A8900", sinon "Inconnu"
-- connect : WiFi / 4G / Ethernet selon case cochée
+- connect : WiFi / 4G / Ethernet selon case cochée.
+  ATTENTION : le produit est souvent imprimé avec les deux options côte à côte, ex. "Axium DX8000 WIFI / 4G". Le vendeur entoure à la main l'option réellement choisie (un cercle/ovale dessiné autour d'un seul des deux mots). Dans ce cas, extraire UNIQUEMENT l'option entourée (ex: si "4G" est entouré → connect = "4G"), jamais les deux options ensemble ni le texte imprimé complet.
 - nb : quantité dans la colonne Qté du bon Inocrea. Si vide alors que terminal sélectionné → nb=0 ET qte_manquante_inocrea=true
 - location_type : "Grenke" si Option 1 cochée, "Inocrea" si Option 2, "Achat" si Option 3
 - loyer_ttc, nbre_loyers (nombre de loyers trimestriels), duree_mois
@@ -826,6 +876,7 @@ Page avec logo de banque belge (Belfius, ING, BNP Paribas Fortis, KBC, Bpost Ban
 ═══ SECTION 6 — SERVICES ═══
 Analyse les pages "Cartes de paiement" et "Services à valeur ajoutée" (si elles ne sont PAS barrées).
 svc_cc = "oui" si la case "Activation Cartes Internationales : 10,00€" est cochée sur la page Cartes de paiement non barrée.
+POUR MARKETPAY (formulaire_mp) : svc_cc = "oui" si VISA et/ou Mastercard est entouré/coché dans le bloc "SCHEMA" de la section 3, quelle que soit la langue du formulaire — "BETAALMIDDELEN" (NL) ou "MOYENS DE PAIEMENT" (FR). Bancontact entouré seul ne suffit pas à lui seul mais ne change rien si Visa/Mastercard sont aussi entourés.
 svc_cr = "oui" si les chèques-repas sont cochés (Edenred, Monizze, Pluxee, Sodexo...) sur une page non barrée.
 svc_dcc = "oui" UNIQUEMENT si la case DCC est cochée sur une page NON barrée. Si barrée → "nc".
 svc_backup = "oui" UNIQUEMENT si la case Backup mode est cochée sur une page NON barrée.
@@ -955,7 +1006,10 @@ JSON à retourner :
 // ============================================================
 function detectAnomalies(d) {
   var an = [];
-  // sev: "red"/"orange" = anomalie contrat, "action" = action welcome call, "green" = conforme
+  // sev: "block" = bloquant retour commercial (rouge foncé)
+  //      "admin" = à corriger par l'admin sur le PDF (orange/violet)
+  //      "action" = à confirmer pendant le welcome call (bleu)
+  //      "green" = conforme
   function add(sev, title, desc) { an.push({sev:sev, title:title, desc:desc}); }
 
   // ── Détecter type de contrat ──
@@ -969,14 +1023,14 @@ function detectAnomalies(d) {
     // ══ VÉRIFICATIONS MARKETPAY ══
     // Pages obligatoires MarketPay
     if (pages.length > 0) {
-      if (!pages.includes('bon_inocrea_mp')) add("red", "Bon de commande Inocrea MarketPay manquant", "Le bon de commande Inocrea (logo MarketPay) est absent du dossier.");
+      if (!pages.includes('bon_inocrea_mp')) add("block", "Bon de commande Inocrea MarketPay manquant", "Le bon de commande Inocrea (logo MarketPay) est absent du dossier.");
       const nbFormMP = pages.filter(p=>p==='formulaire_mp').length;
-      if (nbFormMP === 0) add("red", "Formulaire abonnement MarketPay manquant", "Le formulaire d'abonnement services MarketPay (2 pages) est absent du dossier.");
-      else if (nbFormMP < 2) add("orange", "Formulaire abonnement MarketPay incomplet", "Le formulaire MarketPay fait 2 pages — seulement " + nbFormMP + " page détectée. Vérifier que les 2 pages sont bien incluses.");
-      if (!pages.includes('ubo')) add("red", "Formulaire UBO manquant", "Le formulaire de déclaration des bénéficiaires effectifs (UBO) est obligatoire pour MarketPay.");
-      if (!pages.includes('rib')) add("red", "RIB manquant", "Aucun RIB trouvé. Document obligatoire.");
-      if (!pages.includes('ci_recto')) add("red", "Carte d'identité recto manquante", "La carte d'identité recto est absente.");
-      if (!pages.includes('ci_verso')) add("red", "Carte d'identité verso manquante", "La carte d'identité verso est absente.");
+      if (nbFormMP === 0) add("block", "Formulaire abonnement MarketPay manquant", "Le formulaire d'abonnement services MarketPay (2 pages) est absent du dossier.");
+      else if (nbFormMP < 2) add("admin", "Formulaire abonnement MarketPay incomplet", "Le formulaire MarketPay fait 2 pages — seulement " + nbFormMP + " page détectée. Vérifier que les 2 pages sont bien incluses.");
+      if (!pages.includes('ubo')) add("block", "Formulaire UBO manquant", "Le formulaire de déclaration des bénéficiaires effectifs (UBO) est obligatoire pour MarketPay.");
+      if (!pages.includes('rib')) add("block", "RIB manquant", "Aucun RIB trouvé. Document obligatoire.");
+      if (!pages.includes('ci_recto')) add("block", "Carte d'identité recto manquante", "La carte d'identité recto est absente.");
+      if (!pages.includes('ci_verso')) add("block", "Carte d'identité verso manquante", "La carte d'identité verso est absente.");
     }
   } else {
     // ══ VÉRIFICATIONS WORLDLINE ══
@@ -984,7 +1038,7 @@ function detectAnomalies(d) {
     const pageLabels = {
       bon_inocrea: 'Bon de commande Inocrea', bon_worldline: 'Bon de commande Worldline',
       bancontact: 'Cartes de paiement — Bancontact', cartes_inter: 'Cartes de paiement — Cartes internationales',
-      bon_terminal: 'Bon de commande terminal (DX8000/RX5000)', services_vaa: 'Services à valeur ajoutée'
+      bon_terminal: 'Bon de commande terminal (DX8000/RX5000)', services_vaa: 'Services DCC et chèques repas'
     };
     if (pages.length > 0) {
       const contractPages = pages.filter(p => CORRECT_ORDER.includes(p));
@@ -994,59 +1048,60 @@ function detectAnomalies(d) {
         if (expectedIdx < lastIdx) orderErrors.push(pageLabels[p]||p);
         lastIdx = Math.max(lastIdx, expectedIdx);
       });
-      const missingPages = CORRECT_ORDER.filter(p => !contractPages.includes(p));
-      if (missingPages.length > 0) add("orange", "Pages manquantes dans le dossier", "Pages absentes : " + missingPages.map(p=>pageLabels[p]).join(', ') + ".");
-      if (orderErrors.length > 0) add("orange", "Ordre des pages incorrect", "Pages mal positionnées : " + orderErrors.join(', ') + ". Ordre correct : Bon Inocrea → Bon Worldline → Bancontact → Cartes inter → Bon terminal → Services VAA.");
+      // 'services_vaa' exclu ici : son absence est déjà signalée en détail par le check dédié
+      // plus bas (page_cr_absente), pour éviter un doublon d'anomalie.
+      const missingPages = CORRECT_ORDER.filter(p => !contractPages.includes(p) && p !== 'services_vaa');
+      if (missingPages.length > 0) add("block", "Pages manquantes dans le dossier", "Pages absentes : " + missingPages.map(p=>pageLabels[p]).join(', ') + ".");
+      if (orderErrors.length > 0) add("admin", "Ordre des pages incorrect", "Pages mal positionnées : " + orderErrors.join(', ') + ". Ordre correct : Bon Inocrea → Bon Worldline → Bancontact → Cartes inter → Bon terminal → Services VAA.");
     }
   }
 
   // ── IBAN ──
   if (!d.iban?.v || d.iban.v.trim() === "") {
-    add("red", "IBAN manquant", "Le numéro IBAN est absent du contrat.");
+    add("block", "IBAN manquant", "Le numéro IBAN est absent du contrat.");
   } else if (d.iban.c === "low") {
-    add("orange", "IBAN illisible", "L'IBAN est présent mais difficile à lire. À vérifier.");
+    add("admin", "IBAN illisible", "L'IBAN est présent mais difficile à lire. À vérifier.");
   }
 
   // ── PEPPOL ──
   if (!d.peppol?.v || d.peppol.v.trim() === "") {
-    add("orange", "Peppol ID manquant", "Le Peppol ID n'est pas renseigné dans le contrat.");
+    add("admin", "Peppol ID manquant", "Le Peppol ID n'est pas renseigné dans le contrat.");
     add("action", "Vérifier Peppol ID", "Demander au client son Peppol ID ou le retrouver sur directory.peppol.eu");
   } else if (d._peppol_found === false) {
-    add("red", "Peppol ID : entreprise non trouvée", "L'entreprise n'est pas enregistrée sur directory.peppol.eu. Vérifier avec le client.");
+    add("block", "Peppol ID : entreprise non trouvée", "L'entreprise n'est pas enregistrée sur directory.peppol.eu. Vérifier avec le client.");
     add("action", "Vérifier inscription Peppol", "L'entreprise n'est pas dans le registre Peppol — confirmer avec le client s'il est bien inscrit.");
   } else if (d.peppol?.edited) {
     const wasVal = d.peppol._was || '(vide ou incomplet)';
-    add("orange", "Peppol ID à corriger sur le contrat", "Le contrat indique \"" + wasVal + "\" — le format correct est \"" + d.peppol.v + "\". Corriger sur le bon de commande Worldline.");
+    add("admin", "Peppol ID à corriger sur le contrat", "Le contrat indique \"" + wasVal + "\" — le format correct est \"" + d.peppol.v + "\". Corriger sur le bon de commande Worldline.");
   }
 
   // ── GSM ──
   if (!d.gsm?.v || d.gsm.v.trim() === "") {
-    add("red", "GSM manquant", "Le numéro de GSM est obligatoire pour le contrôle UBO. Non renseigné dans le contrat.");
-    add("action", "Demander le GSM", "Le numéro de GSM est absent — le demander au client pendant l'appel (commence par 045x/046x/047x/048x/049x).");
+    add("action", "GSM manquant", "Le numéro de GSM est absent du contrat — le demander au client (commence par 045x/046x/047x/048x/049x). Obligatoire pour le contrôle UBO.");
   }
 
   // ── SIGNATURE ──
   if (!d.signature_presente) {
-    add("red", "Signature absente", "Le contrat ne semble pas signé par le client.");
+    add("block", "Signature absente", "Le contrat ne semble pas signé par le client.");
   }
 
   // ── MODÈLE ──
   const KNOWN_MODELS = ['RX5000','DX8000','Yomani Double Module','MarketPay PAX A8500 + Q25','MarketPay PAX A8900'];
   if (!d.modele?.v || d.modele.v.trim() === "") {
-    add("orange", "Modèle de terminal incertain", "Le modèle de terminal n'est pas clairement identifié.");
+    add("admin", "Modèle de terminal incertain", "Le modèle de terminal n'est pas clairement identifié.");
   } else if (!KNOWN_MODELS.includes(d.modele.v)) {
-    add("orange", "Modèle inconnu", "Le modèle \""+d.modele.v+"\" n'est pas reconnu. Vérifier le contrat.");
+    add("admin", "Modèle inconnu", "Le modèle \""+d.modele.v+"\" n'est pas reconnu. Vérifier le contrat.");
   }
 
   // ── DX8000 ──
   if (d.modele?.v === "DX8000" || (d.modele?.v && d.modele.v.includes("DX8000"))) {
     if (!d.kit?.v || d.kit.v === "aucun") {
-      add("red", "Kit non sélectionné (DX8000)", "Pour le DX8000, le Kit Start ou Kit Pro doit impérativement être coché.");
+      add("block", "Kit non sélectionné (DX8000)", "Pour le DX8000, le Kit Start ou Kit Pro doit impérativement être coché.");
     }
     if (d.dx_ref?.v === "C01615") {
-      add("red", "Référence DX incorrecte", "La référence C01615 n'est pas autorisée. Seul C01602 est valide pour le DX8000.");
+      add("block", "Référence DX incorrecte", "La référence C01615 n'est pas autorisée. Seul C01602 est valide pour le DX8000.");
     } else if (!d.dx_ref?.v || d.dx_ref.v.trim() === "" || d.dx_ref.v === "aucun") {
-      add("orange", "Référence DX manquante", "La référence du module DX (C01602) doit être indiquée au contrat.");
+      add("admin", "Référence DX manquante", "La référence du module DX (C01602) doit être indiquée au contrat.");
     }
   }
 
@@ -1054,13 +1109,13 @@ function detectAnomalies(d) {
   if (d.modele?.v === "RX5000") {
     const cs = d.caisse_statut;
     if (cs === "manquant" || !d.caisse?.v || d.caisse.v.trim() === "") {
-      add("red", "RX5000 : système de caisse manquant", "Le RX5000 nécessite un système de caisse. À renseigner obligatoirement.");
+      add("block", "RX5000 : système de caisse manquant", "Le RX5000 nécessite un système de caisse. À renseigner obligatoirement.");
       add("action", "Confirmer système de caisse", "Demander au client quel système de caisse il utilise et vérifier sa compatibilité Worldline.");
     } else if (cs === "reconfirmer") {
-      add("orange", "Système de caisse à reconfirmer", "\"" + (d.caisse?.v||"") + "\" ressemble à \"" + (d.caisse_suggestion||"?") + "\" — faute d'orthographe probable. Corriger sur le contrat.");
+      add("action", "Système de caisse à reconfirmer", "\"" + (d.caisse?.v||"") + "\" ressemble à \"" + (d.caisse_suggestion||"?") + "\" — faute d'orthographe probable. Corriger sur le contrat.");
       add("action", "Confirmer nom du système de caisse", "Reconfirmer l'orthographe exacte avec le client : \"" + (d.caisse?.v||"") + "\" → probablement \"" + (d.caisse_suggestion||"?") + "\".");
     } else if (cs === "inconnu") {
-      add("orange", "Système de caisse inconnu", "\"" + (d.caisse?.v||"") + "\" n'est pas dans la liste des intégrateurs Worldline. À vérifier.");
+      add("action", "Système de caisse inconnu", "\"" + (d.caisse?.v||"") + "\" n'est pas dans la liste des intégrateurs Worldline. À vérifier.");
       add("action", "Vérifier compatibilité caisse", "\"" + (d.caisse?.v||"") + "\" non reconnu — confirmer avec le client et vérifier la liste Worldline.");
     } else if (cs === "valide" && d.caisse?.edited) {
       add("green", "Système de caisse corrigé", "Anomalie initiale résolue — caisse confirmée : " + (d.caisse?.v||""));
@@ -1071,13 +1126,13 @@ function detectAnomalies(d) {
   // ── QUANTITÉS (Worldline seulement) ──
   if (!isMP) {
     if (d.qte_manquante_inocrea === true || (d.nb && String(d.nb?.v) === '0')) {
-      add("red", "Quantité manquante (bon Inocrea)", "Le terminal est sélectionné mais la colonne Qté est vide sur le bon Inocrea. Worldline peut refuser le dossier.");
+      add("admin", "Quantité manquante (bon Inocrea)", "Le terminal est sélectionné mais la colonne Qté est vide sur le bon Inocrea. Worldline peut refuser le dossier.");
     }
     if (d.qte_manquante_worldline === true) {
-      add("red", "Quantité manquante (bon Worldline)", "Le kit est sélectionné mais la colonne Qté est vide sur le bon Worldline. Une quantité est obligatoire.");
+      add("admin", "Quantité manquante (bon Worldline)", "Le kit est sélectionné mais la colonne Qté est vide sur le bon Worldline. Une quantité est obligatoire.");
     }
     if (d.qte_illisible_worldline === true) {
-      add("orange", "Quantité illisible (bon Worldline)", "La colonne Qté semble renseignée mais n'est pas clairement lisible. Reconfirmer avec le commercial.");
+      add("admin", "Quantité illisible (bon Worldline)", "La colonne Qté semble renseignée mais n'est pas clairement lisible. Reconfirmer avec le commercial.");
     }
   }
 
@@ -1087,7 +1142,7 @@ function detectAnomalies(d) {
     const nbreLoyers = parseInt(String(d.nbre_loyers?.v||'0').replace(/[^0-9]/g,'')) || 0;
     const dureeEffective = duree || (nbreLoyers * 3);
     if (dureeEffective > 63 && dureeEffective > 0) {
-      add("red", "Durée invalide : " + dureeEffective + " mois", "La durée maximale autorisée est de 63 mois (21 loyers trimestriels). Ce contrat indique " + dureeEffective + " mois — retourner au commercial pour corriger la durée, le loyer HTVA, la TVA et le loyer TTC.");
+      add("block", "Durée invalide : " + dureeEffective + " mois", "La durée maximale autorisée est de 63 mois (21 loyers trimestriels). Ce contrat indique " + dureeEffective + " mois — retourner au commercial pour corriger la durée, le loyer HTVA, la TVA et le loyer TTC.");
     }
   }
 
@@ -1102,56 +1157,56 @@ function detectAnomalies(d) {
   } else {
     if (!d.connect?.v || d.connect.v.trim() === "") {
       var connOpts = (d.modele&&d.modele.v==="RX5000") ? "WiFi ou Ethernet" : (d.modele&&d.modele.v&&d.modele.v.includes("Yomani")) ? "Ethernet" : "WiFi ou 4G";
-      add("red", "Connectivité non cochée", "La connectivité doit être indiquée au contrat ("+connOpts+").");
+      add("block", "Connectivité non cochée", "La connectivité doit être indiquée au contrat ("+connOpts+").");
     }
   }
 
   // ── EMAIL ──
   if (!d.email?.v || d.email.v.trim() === "") {
-    add("orange", "Email client manquant", "L'adresse email n'est pas renseignée.");
+    add("action", "Email client manquant", "L'adresse email n'est pas renseignée.");
     add("action", "Demander l'email", "L'adresse email du client est absente — la demander pendant l'appel.");
   } else if (d.email.v && !d.email.v.includes("@")) {
-    add("red", "Email invalide", "L'adresse email semble incorrecte : " + d.email.v);
+    add("block", "Email invalide", "L'adresse email semble incorrecte : " + d.email.v);
   }
 
   // ── BANCONTACT PAR TRANSACTION (Worldline seulement) ──
   if (!isMP && d.bancontact_par_transaction === true) {
-    add("orange", "Bancontact par transaction — code 120 requis", "Les sections Bancontact BOOST et abonnement sont barrées. Le client est en Bancontact par transaction. Ajouter le code \"AlnocreaD120\" dans le champ prévu sur le bon Worldline." + (d.bancontact_tarif ? " Tarif lu : " + d.bancontact_tarif + " par transaction." : ""));
+    add("admin", "Bancontact par transaction — code 120 requis", "Les sections Bancontact BOOST et abonnement sont barrées. Le client est en Bancontact par transaction. Ajouter le code \"AlnocreaD120\" dans le champ prévu sur le bon Worldline." + (d.bancontact_tarif ? " Tarif lu : " + d.bancontact_tarif + " par transaction." : ""));
   }
 
   // ── PAGE SERVICES / CHÈQUES REPAS (Worldline seulement) ──
   if (!isMP && d.page_cr_absente === true) {
-    add("orange", "Page Services à valeur ajoutée absente", "La page 'Services à valeur ajoutée' (Backup mode, DCC, Chèques repas) n'est pas dans le dossier. Le commercial doit la fournir.");
-    add("action", "Confirmer services additionnels", "La page Services à valeur ajoutée est absente — demander au client s'il souhaite Backup mode, DCC ou chèques repas.");
+    add("block", "Page Services DCC et chèques repas absente", "La page 'Services DCC et chèques repas' (inclut aussi Backup mode) n'est pas dans le dossier. Le commercial doit la fournir.");
+    add("action", "Confirmer services additionnels", "La page Services DCC et chèques repas est absente — demander au client s'il souhaite Backup mode, DCC ou chèques repas.");
   }
 
   // ── MarketPay — vérifications spécifiques ──
   if (isMP) {
     if (!d.abonnement?.v || d.abonnement.v.trim() === '') {
-      add("orange", "Abonnement MarketPay non renseigné", "Le plan d'abonnement (INO-Mobile, INO-Basic, INO-Max) doit être coché sur le bon de commande.");
+      add("admin", "Abonnement MarketPay non renseigné", "Le plan d'abonnement (INO-Mobile, INO-Basic, INO-Max) doit être coché sur le bon de commande.");
     }
-    if (d.svc_cr === "oui") add("red", "MarketPay: chèques-repas incompatibles", "Le MarketPay ne supporte pas les chèques-repas.");
-    if (d.svc_ores === "oui") add("red", "MarketPay: ORES incompatible", "Le MarketPay ne supporte pas ORES.");
-    if (d.svc_barra === "oui") add("red", "MarketPay: Barracuda incompatible", "Le MarketPay ne supporte pas Barracuda.");
-    if (d.svc_eid === "oui") add("red", "MarketPay: Lecteur ID incompatible", "Le MarketPay ne supporte pas le lecteur ID.");
-    if (d.svc_pad === "oui") add("red", "MarketPay: Paiement distance incompatible", "Le MarketPay ne supporte pas le paiement à distance.");
+    if (d.svc_cr === "oui") add("block", "MarketPay: chèques-repas incompatibles", "Le MarketPay ne supporte pas les chèques-repas.");
+    if (d.svc_ores === "oui") add("block", "MarketPay: ORES incompatible", "Le MarketPay ne supporte pas ORES.");
+    if (d.svc_barra === "oui") add("block", "MarketPay: Barracuda incompatible", "Le MarketPay ne supporte pas Barracuda.");
+    if (d.svc_eid === "oui") add("block", "MarketPay: Lecteur ID incompatible", "Le MarketPay ne supporte pas le lecteur ID.");
+    if (d.svc_pad === "oui") add("block", "MarketPay: Paiement distance incompatible", "Le MarketPay ne supporte pas le paiement à distance.");
   }
 
   // ── Services DX/RX (Worldline) ──
   if (!isMP && (d.modele?.v === "DX8000" || d.modele?.v === "RX5000")) {
-    if (d.svc_ores === "oui") add("red", "ORES non disponible", "ORES n'est disponible que sur le Yomani Double Module.");
-    if (d.svc_barra === "oui") add("red", "Barracuda non disponible", "Barracuda n'est disponible que sur le Yomani Double Module.");
-    if (d.svc_eid === "oui") add("red", "Lecteur ID non disponible", "Le lecteur ID n'est disponible que sur le Yomani Double Module.");
+    if (d.svc_ores === "oui") add("block", "ORES non disponible", "ORES n'est disponible que sur le Yomani Double Module.");
+    if (d.svc_barra === "oui") add("block", "Barracuda non disponible", "Barracuda n'est disponible que sur le Yomani Double Module.");
+    if (d.svc_eid === "oui") add("block", "Lecteur ID non disponible", "Le lecteur ID n'est disponible que sur le Yomani Double Module.");
   }
 
   // ── BCE / SOCIÉTÉ ──
   if (!d.bce?.v || d.bce.v.trim() === "") {
-    add("orange", "Numéro BCE / TVA manquant", "Le numéro d'entreprise n'est pas renseigné.");
+    add("admin", "Numéro BCE / TVA manquant", "Le numéro d'entreprise n'est pas renseigné.");
   } else if (d.bce?.edited) {
     add("green", "BCE / TVA corrigé", "Information complétée/corrigée avec le client : " + d.bce.v);
   }
   if (!d.societe?.v || d.societe.v.trim() === "") {
-    add("red", "Nom société manquant", "Le nom de la société n'est pas lisible dans le contrat.");
+    add("block", "Nom société manquant", "Le nom de la société n'est pas lisible dans le contrat.");
   } else if (d.societe?.edited) {
     add("green", "Nom société corrigé", "Information corrigée avec le client : " + d.societe.v);
   }
@@ -1164,16 +1219,16 @@ function detectAnomalies(d) {
   // ── RIB (Worldline seulement — MarketPay déjà géré via pages_ordre) ──
   if (!isMP) {
     if (d.doc_rib_present === false) {
-      add("red", "RIB manquant", "Aucun RIB trouvé. Document obligatoire.");
+      add("block", "RIB manquant", "Aucun RIB trouvé. Document obligatoire.");
     } else if (d.doc_rib_present === true) {
-      if (!d.doc_rib_banque) add("orange", "RIB: banque non visible", "Le nom de la banque doit apparaître sur le document.");
-      if (d.doc_rib_iban_match === false) add("red", "RIB: IBAN ne correspond pas", "L'IBAN du RIB ne correspond pas au contrat.");
+      if (!d.doc_rib_banque) add("admin", "RIB: banque non visible", "Le nom de la banque doit apparaître sur le document.");
+      if (d.doc_rib_iban_match === false) add("block", "RIB: IBAN ne correspond pas", "L'IBAN du RIB ne correspond pas au contrat.");
       if (d.doc_rib_ok) add("green", "RIB conforme", "Banque " + (d.doc_rib_banque||"") + ", société " + (d.doc_rib_societe||"") + ", IBAN vérifié.");
     }
   } else {
     // MarketPay : RIB vérifié via pages_ordre, mais on vérifie quand même la concordance IBAN
     if (d.doc_rib_present === true) {
-      if (d.doc_rib_iban_match === false) add("red", "RIB: IBAN ne correspond pas", "L'IBAN du RIB ne correspond pas au contrat.");
+      if (d.doc_rib_iban_match === false) add("block", "RIB: IBAN ne correspond pas", "L'IBAN du RIB ne correspond pas au contrat.");
       if (d.doc_rib_ok) add("green", "RIB conforme", "Banque " + (d.doc_rib_banque||"") + ", IBAN vérifié.");
     }
   }
@@ -1183,15 +1238,15 @@ function detectAnomalies(d) {
   const ciPresente = d.doc_ci_recto === true || d.doc_ci_verso === true;
   if (!isMP) {
     // Worldline : vérifications complètes CI
-    if (d.doc_ci_recto === false) add("red", "Carte d'identité recto manquante", "La carte d'identité recto est absente.");
-    if (d.doc_ci_verso === false) add("red", "Carte d'identité verso manquante", "La carte d'identité verso est absente.");
+    if (d.doc_ci_recto === false) add("block", "Carte d'identité recto manquante", "La carte d'identité recto est absente.");
+    if (d.doc_ci_verso === false) add("block", "Carte d'identité verso manquante", "La carte d'identité verso est absente.");
   }
   // Couleur : uniquement si CI présente mais N&B (applicable Worldline ET MarketPay)
   if (ciPresente && d.doc_ci_couleur === false) {
-    add("red", "Carte d'identité en noir et blanc", "La carte d'identité doit être en couleur.");
+    add("block", "Carte d'identité en noir et blanc", "La carte d'identité doit être en couleur.");
   }
-  if (d.doc_ci_valide === false && ciPresente) add("red", "Carte d'identité expirée", "Document expiré. Le client doit fournir une carte valide.");
-  if (d.doc_ci_qualite === "low" && ciPresente) add("orange", "Carte d'identité: qualité insuffisante", "Photo floue ou illisible.");
+  if (d.doc_ci_valide === false && ciPresente) add("block", "Carte d'identité expirée", "Document expiré. Le client doit fournir une carte valide.");
+  if (d.doc_ci_qualite === "low" && ciPresente) add("admin", "Carte d'identité: qualité insuffisante", "Photo floue ou illisible.");
   if (d.doc_ci_recto && d.doc_ci_verso && d.doc_ci_couleur && d.doc_ci_valide && d.doc_ci_qualite !== "low") {
     add("green", "Carte d'identité conforme", "Recto/verso couleur, valide jusqu'au " + (d.doc_ci_validite||"?"));
   }
@@ -1201,9 +1256,6 @@ function detectAnomalies(d) {
 
 
 function renderAnalysis() {
-  const redCount = ANOMALIES.filter(a=>a.sev==='red').length;
-  const orangeCount = ANOMALIES.filter(a=>a.sev==='orange').length;
-
   const g = (key) => {
     const obj = D[key];
     if (!obj) return '';
@@ -1217,7 +1269,7 @@ function renderAnalysis() {
     const col = c==='high'?'var(--green)':c==='med'?'var(--orange)':'var(--red)';
     const bg  = c==='high'?'var(--green-lt)':c==='med'?'var(--orange-lt)':'var(--red-lt)';
     const brd = c==='high'?'var(--green-bd)':c==='med'?'var(--orange-bd)':'var(--red-bd)';
-    return '<span style="display:inline-block;background:'+bg+';color:'+col+';border:1px solid '+brd+';border-radius:4px;font-size:11px;font-weight:700;padding:1px 6px;margin-right:5px;vertical-align:middle">'+lbl+'</span>';
+    return '<span id="badge_'+key+'" style="display:inline-block;background:'+bg+';color:'+col+';border:1px solid '+brd+';border-radius:4px;font-size:11px;font-weight:700;padding:1px 6px;margin-right:5px;vertical-align:middle">'+lbl+'</span>';
   };
 
   const SELECT_OPTS = {
@@ -1256,12 +1308,37 @@ function renderAnalysis() {
         '</div></td></tr>';
     }
 
+    const extraCell = key==='bce'
+      ? '<td style="padding:7px 6px;text-align:center;white-space:nowrap"><button onclick="checkBCE()" id="btnCheckBCE" style="background:#EFF6FF;color:#1D4ED8;border:1px solid #93C5FD;border-radius:5px;padding:4px 9px;font-size:11px;font-weight:700;cursor:pointer;font-family:inherit">🔍 Vérifier BCE</button></td>'
+      : key==='iban'
+      ? '<td style="padding:7px 6px;text-align:center;white-space:nowrap"><button onclick="checkIBAN()" id="btnCheckIBAN" style="background:#EFF6FF;color:#1D4ED8;border:1px solid #93C5FD;border-radius:5px;padding:4px 9px;font-size:11px;font-weight:700;cursor:pointer;font-family:inherit">🔄 Vérifier</button></td>'
+      : '';
+    const colspanVal = (key==='bce' || key==='iban') ? 4 : 3;
+
+    // Ligne d'info sous l'IBAN : résultat du check openiban.com (validité, banque, IBAN, BIC)
+    const ibanInfoContent = (function(){
+      if (D._iban_invalid === true) {
+        const msg = (D._iban_messages && D._iban_messages.length) ? D._iban_messages.join(', ') : 'format ou checksum incorrect';
+        return '<span style="color:var(--red);font-weight:600">🚫 Invalide — '+msg+'</span>';
+      }
+      if (D._iban_bank) {
+        const parts = ['✓ Validé', D._iban_bank, D._iban_normalized, D._iban_bic ? 'BIC '+D._iban_bic : ''].filter(Boolean).join(' · ');
+        return '<span style="color:var(--green);font-weight:600">'+parts+'</span>';
+      }
+      return '';
+    })();
+    const ibanInfoRow = key==='iban'
+      ? '<tr style="border-bottom:1px solid var(--border)"><td></td><td colspan="3" id="ibanInfoCell" style="padding:0 10px 8px;font-size:11px">'+ibanInfoContent+'</td></tr>'
+      : '';
+
     return '<tr style="border-bottom:1px solid var(--border)">' +
       '<td style="padding:7px 10px;font-size:11px;font-weight:700;text-transform:uppercase;color:var(--muted);white-space:nowrap;width:32%">'+label+'</td>' +
       '<td style="padding:7px 10px;font-size:13px;font-weight:600;color:'+displayColor+'">'+badge(key)+'<span id="'+dispId+'">'+displayVal+'</span></td>' +
       '<td style="padding:7px 6px;width:24px;text-align:center"><span onclick="toggleEdit(this,\''+key+'\')" style="cursor:pointer;font-size:11px;color:var(--muted)">✎</span></td>' +
+      extraCell +
       '</tr>' +
-      '<tr id="'+editRowId+'" style="display:none;background:var(--orange-lt)"><td colspan="3" style="padding:2px 10px 7px">' +
+      ibanInfoRow +
+      '<tr id="'+editRowId+'" style="display:none;background:var(--orange-lt)"><td colspan="'+colspanVal+'" style="padding:2px 10px 7px">' +
       '<div style="display:flex;gap:6px;align-items:center">' +
       '<input type="text" id="edit_'+key+'" value="'+val.replace(/"/g,'&quot;')+'" data-key="'+key+'" ' +
       'style="flex:1;border:1.5px solid var(--orange);border-radius:5px;padding:5px 8px;font-size:12px;font-family:inherit;outline:none;background:#fff">' +
@@ -1283,7 +1360,8 @@ function renderAnalysis() {
   };
 
   // Separate anomalies from green
-  const contractAnom = ANOMALIES.filter(a => a.sev==='red' || a.sev==='orange');
+  const blockItems = ANOMALIES.filter(a => a.sev==='block');
+  const adminItems = ANOMALIES.filter(a => a.sev==='admin');
   const actionItems = ANOMALIES.filter(a => a.sev==='action');
   const docOK = ANOMALIES.filter(a => a.sev==='green');
   const _mod = g('modele');
@@ -1291,21 +1369,22 @@ function renderAnalysis() {
   const isRX = _mod.includes('RX5000');
   const isMP = _mod.startsWith('MarketPay');
 
-  const anomHtml = contractAnom.length === 0
-    ? '<div style="padding:8px;font-size:13px;color:var(--green);font-weight:600">✅ Aucune anomalie sur le contrat.</div>'
-    : contractAnom.map(a =>
-        '<div style="display:flex;gap:8px;padding:8px 10px;border-radius:6px;margin-bottom:5px;background:'+(a.sev==='red'?'var(--red-lt)':'var(--orange-lt)')+';border-left:3px solid '+(a.sev==='red'?'var(--red)':'var(--orange)')+'">'+
-        '<span>'+(a.sev==='red'?'🚫':'⚠️')+'</span>'+
-        '<div><div style="font-size:12px;font-weight:700;color:'+(a.sev==='red'?'var(--red)':'var(--orange)')+'">'+a.title+'</div>'+
-        '<div style="font-size:11px;color:var(--muted)">'+a.desc+'</div></div></div>'
-      ).join('');
-
-  const actionHtml = actionItems.length === 0 ? '' : actionItems.map(a =>
-    '<div style="display:flex;gap:8px;padding:8px 10px;border-radius:6px;margin-bottom:5px;background:#EFF6FF;border-left:3px solid #3B82F6">'+
-    '<span>📋</span>'+
-    '<div><div style="font-size:12px;font-weight:700;color:#1D4ED8">'+a.title+'</div>'+
+  const makeAnomalyHtml = (items, bg, border, color, icon) => items.map(a =>
+    '<div style="display:flex;gap:8px;padding:8px 10px;border-radius:6px;margin-bottom:5px;background:'+bg+';border-left:3px solid '+border+'">'+
+    '<span>'+icon+'</span>'+
+    '<div><div style="font-size:12px;font-weight:700;color:'+color+'">'+a.title+'</div>'+
     '<div style="font-size:11px;color:var(--muted)">'+a.desc+'</div></div></div>'
   ).join('');
+
+  const anomHtml = blockItems.length === 0
+    ? '<div style="padding:8px;font-size:13px;color:var(--green);font-weight:600">✅ Aucun point bloquant.</div>'
+    : makeAnomalyHtml(blockItems,'var(--red-lt)','var(--red)','var(--red)','🚫');
+
+  const adminHtml = adminItems.length === 0 ? '' :
+    makeAnomalyHtml(adminItems,'#F3F0FF','#7C3AED','#7C3AED','🔧');
+
+  const actionHtml = actionItems.length === 0 ? '' :
+    makeAnomalyHtml(actionItems,'#EFF6FF','#3B82F6','#1D4ED8','📋');
 
   const docBadgeHtml = (label, present, ok, details) => {
     const cls = present===false?'red':ok?'green':'orange';
@@ -1341,9 +1420,7 @@ function renderAnalysis() {
         <div style="font-size:16px;font-weight:700;color:var(--navy)">${g('societe')||'Société inconnue'}</div>
       </div>
       <div style="display:flex;gap:7px;flex-wrap:wrap" id="anomCounters">
-        ${redCount>0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:var(--red-lt);color:var(--red);border:1px solid var(--red-bd)">🚫 '+redCount+' bloquant'+(redCount>1?'s':'')+'</div>':''}
-        ${orangeCount>0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:var(--orange-lt);color:var(--orange);border:1px solid var(--orange-bd)">⚠️ '+orangeCount+' à vérifier</div>':''}
-        ${redCount===0&&orangeCount===0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:var(--green-lt);color:var(--green);border:1px solid var(--green-bd)">✅ Conforme</div>':''}
+        <div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:var(--blue-lt);color:var(--blue);border:1px solid var(--blue-bd)">${isMP ? 'Contrat MarketPay' : 'Contrat Worldline'}</div>
       </div>
     </div>
 
@@ -1384,7 +1461,7 @@ function renderAnalysis() {
             ${row('Modèle','modele')}
             ${row('Connectivité','connect')}
             ${row('Nb terminaux','nb')}
-            ${row('Kit','kit')}
+            ${row('Assistance technique','kit')}
             ${isDX ? row('Réf DX','dx_ref') : ''}
             ${row('Caisse','caisse')}
           </table>
@@ -1421,16 +1498,24 @@ function renderAnalysis() {
       </div>
 
       <div class="section-card" style="grid-column:1/-1">
-        <div class="sc-head" id="anomaliesHead" style="${contractAnom.length?'background:var(--orange);color:#fff':''}">
-          ${contractAnom.length?'⚠️ Anomalies à corriger sur le contrat':'✅ Aucune anomalie sur le contrat'}
+        <div class="sc-head" id="anomaliesHead" style="${blockItems.length?'background:var(--red);color:#fff':'background:var(--green);color:#fff'}">
+          ${blockItems.length?'🚫 '+blockItems.length+' point'+(blockItems.length>1?'s':'')+' bloquant'+(blockItems.length>1?'s':'')+' — Retour commercial requis':'✅ Aucun point bloquant'}
         </div>
         <div class="sc-body" style="padding:8px" id="anomaliesBox">${anomHtml}</div>
       </div>
 
+      ${adminItems.length ? `
+      <div class="section-card" style="grid-column:1/-1">
+        <div class="sc-head" style="background:#7C3AED;color:#fff">
+          🔧 ${adminItems.length} correction${adminItems.length>1?'s':''} à effectuer par l'admin sur le contrat
+        </div>
+        <div class="sc-body" style="padding:8px" id="adminBox">${adminHtml}</div>
+      </div>` : ''}
+
       ${actionItems.length ? `
       <div class="section-card" style="grid-column:1/-1">
         <div class="sc-head" style="background:#1D4ED8;color:#fff">
-          📋 Actions à confirmer avec le client
+          📋 ${actionItems.length} point${actionItems.length>1?'s':''} à confirmer pendant le Welcome Call
         </div>
         <div class="sc-body" style="padding:8px" id="actionsBox">${actionHtml}</div>
       </div>` : ''}
@@ -1537,13 +1622,22 @@ function validateEdit(key) {
   const val = inp.value.trim();
   if (!D[key]) D[key] = {v:'',c:'high'};
   D[key].v = val; D[key].edited = true;
+  D[key].c = 'high'; // ── Badge vert après validation manuelle
   const disp = document.getElementById('disp_'+key);
   if (disp) disp.textContent = val || 'Non renseigné';
+  // Mettre à jour le badge visuellement
+  const badgeEl = document.getElementById('badge_'+key);
+  if (badgeEl) {
+    badgeEl.textContent = '✓';
+    badgeEl.style.background = 'var(--green-lt)';
+    badgeEl.style.color = 'var(--green)';
+    badgeEl.style.borderColor = 'var(--green-bd)';
+  }
   const row = document.getElementById('erow_'+key);
   if (row) row.style.display = 'none';
   const labels = {societe:'Société',bce:'BCE/TVA',adresse_facturation:'Adresse facturation',adresse_livraison:'Adresse livraison',email:'Email',tel:'Tél fixe',gsm:'GSM',
     contact:'Contact',peppol:'Peppol',iban:'IBAN',commercial:'Commercial',caisse:'Caisse',
-    loyer_ttc:'Loyer',duree_mois:'Durée',nbre_loyers:'Nb loyers'};
+    loyer_ttc:'Loyer',duree_mois:'Durée',nbre_loyers:'Nb loyers',date_signature:'Date signature'};
   const msg = 'Corriger '+(labels[key]||key)+' : '+val;
   const idx = ACTIONS.findIndex(a=>a.msg.startsWith('Corriger '+(labels[key]||key)));
   if (idx>=0) ACTIONS[idx].msg=msg; else addAction('o',msg);
@@ -1556,8 +1650,16 @@ function validateSelect(key) {
   const val = sel.value;
   if (!D[key]) D[key] = {v:'',c:'high'};
   D[key].v = val; D[key].edited = true;
+  D[key].c = 'high'; // ── Badge vert après validation manuelle
   const disp = document.getElementById('disp_'+key);
   if (disp) disp.textContent = val || 'Non renseigné';
+  const badgeEl = document.getElementById('badge_'+key);
+  if (badgeEl) {
+    badgeEl.textContent = '✓';
+    badgeEl.style.background = 'var(--green-lt)';
+    badgeEl.style.color = 'var(--green)';
+    badgeEl.style.borderColor = 'var(--green-bd)';
+  }
   const row = document.getElementById('erow_'+key);
   if (row) row.style.display = 'none';
   const labels = {modele:'Modèle',connect:'Connectivité',kit:'Kit',dx_ref:'Réf DX',
@@ -1570,6 +1672,214 @@ function validateSelect(key) {
 
 function updateSelectField(sel, key) {
   validateSelect(key);
+}
+
+// ============================================================
+// VÉRIFICATION / REVÉRIFICATION IBAN (openiban.com)
+// ============================================================
+function checkIBAN() {
+  const val = D.iban?.v || '';
+  const ibanClean = val.replace(/[\s\-]/g,'').toUpperCase();
+  const btn = document.getElementById('btnCheckIBAN');
+  const cell = document.getElementById('ibanInfoCell');
+  if (!ibanClean) {
+    if (cell) cell.innerHTML = '<span style="color:var(--red);font-weight:600">🚫 Aucun IBAN renseigné</span>';
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Vérification...'; }
+  if (cell) cell.innerHTML = '<span style="color:var(--muted)">⏳ Vérification en cours...</span>';
+
+  fetch('https://openiban.com/validate/' + ibanClean + '?getBIC=true&validateBankCode=true')
+    .then(function(resp){ return resp.json(); })
+    .then(function(ibanData){
+      if (ibanData.valid === false) {
+        D.iban.c = 'low';
+        D._iban_invalid = true;
+        D._iban_messages = ibanData.messages || [];
+        D._iban_bic = ''; D._iban_bank = ''; D._iban_zip = ''; D._iban_city = ''; D._iban_normalized = '';
+      } else if (ibanData.valid === true) {
+        D.iban.c = 'high';
+        D._iban_invalid = false;
+        D._iban_bic = ibanData.bankData?.bic || '';
+        D._iban_bank = ibanData.bankData?.name || '';
+        D._iban_zip = ibanData.bankData?.zip || '';
+        D._iban_city = ibanData.bankData?.city || '';
+        D._iban_normalized = ibanData.iban || ibanClean;
+      }
+      refreshIbanInfoDisplay();
+    })
+    .catch(function(){
+      if (cell) cell.innerHTML = '<span style="color:var(--red);font-weight:600">🚫 Service de vérification injoignable</span>';
+    })
+    .finally(function(){
+      if (btn) { btn.disabled = false; btn.textContent = '🔄 Vérifier'; }
+    });
+}
+
+function refreshIbanInfoDisplay() {
+  const cell = document.getElementById('ibanInfoCell');
+  if (cell) {
+    if (D._iban_invalid === true) {
+      const msg = (D._iban_messages && D._iban_messages.length) ? D._iban_messages.join(', ') : 'format ou checksum incorrect';
+      cell.innerHTML = '<span style="color:var(--red);font-weight:600">🚫 Invalide — '+msg+'</span>';
+    } else if (D._iban_bank) {
+      const parts = ['✓ Validé', D._iban_bank, D._iban_normalized, D._iban_bic ? 'BIC '+D._iban_bic : ''].filter(Boolean).join(' · ');
+      cell.innerHTML = '<span style="color:var(--green);font-weight:600">'+parts+'</span>';
+    } else {
+      cell.innerHTML = '';
+    }
+  }
+  const badgeEl = document.getElementById('badge_iban');
+  if (badgeEl) {
+    const ok = D._iban_invalid !== true;
+    badgeEl.textContent = ok ? '✓' : '✗';
+    badgeEl.style.background = ok ? 'var(--green-lt)' : 'var(--red-lt)';
+    badgeEl.style.color = ok ? 'var(--green)' : 'var(--red)';
+    badgeEl.style.borderColor = ok ? 'var(--green-bd)' : 'var(--red-bd)';
+  }
+  refreshAnomalies();
+}
+
+// ============================================================
+// VÉRIFICATION BCE (Banque-Carrefour des Entreprises)
+// ============================================================
+// À CONFIGURER : URL du Cloudflare Worker qui relaie l'appel vers l'API BCE
+// (CBEAPI ou équivalent) en gardant la clé API secrète côté serveur.
+// Le Worker doit accepter GET <BCE_WORKER_URL>?numero=<numéro nettoyé, 10 chiffres>
+// et répondre en JSON avec la forme :
+//   Succès : { "success": true, "data": { "denomination": "...", "formeJuridique": "...", "adresse": "..." } }
+//   Échec  : { "success": false, "error": "message lisible" }
+const BCE_WORKER_URL = 'https://REMPLACER-PAR-TON-WORKER.workers.dev/bce';
+
+function cleanBceNumber(raw) {
+  return String(raw || '')
+    .toUpperCase()
+    .replace(/^BE/, '')
+    .replace(/[.\-\s]/g, '')
+    .trim();
+}
+
+function checkBCE() {
+  const numeroBrut = D.bce?.v || '';
+  const numero = cleanBceNumber(numeroBrut);
+  if (!numero || numero.length < 9) {
+    alert('Le numéro BCE/TVA semble invalide ou vide. Corrige-le (✎) avant de vérifier.');
+    return;
+  }
+  openBCEModal();
+  renderBCEModalLoading();
+
+  fetch(BCE_WORKER_URL + '?numero=' + encodeURIComponent(numero))
+    .then(function(resp) {
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      return resp.json();
+    })
+    .then(function(json) {
+      if (!json || json.success !== true || !json.data) {
+        renderBCEModalError(json && json.error ? json.error : 'Numéro introuvable à la BCE.');
+        return;
+      }
+      renderBCEModalResult(json.data);
+    })
+    .catch(function(err) {
+      renderBCEModalError('Impossible de contacter le service de vérification (' + err.message + ').');
+    });
+}
+
+function openBCEModal() {
+  if (document.getElementById('bceModalOverlay')) return;
+  const overlay = document.createElement('div');
+  overlay.id = 'bceModalOverlay';
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:9999;display:flex;align-items:center;justify-content:center;padding:20px';
+  overlay.onclick = function(e) { if (e.target === overlay) closeBCEModal(); };
+
+  const box = document.createElement('div');
+  box.id = 'bceModalBox';
+  box.style.cssText = 'background:#fff;border-radius:12px;max-width:560px;width:100%;max-height:85vh;overflow-y:auto;box-shadow:0 20px 60px rgba(0,0,0,.35)';
+  box.innerHTML =
+    '<div style="background:linear-gradient(135deg,var(--navy),var(--navy2));color:#fff;padding:14px 18px;border-radius:12px 12px 0 0;display:flex;align-items:center;justify-content:space-between">' +
+      '<div style="font-size:14px;font-weight:700">🔍 Vérification BCE</div>' +
+      '<span onclick="closeBCEModal()" style="cursor:pointer;font-size:18px;line-height:1;opacity:.8">✕</span>' +
+    '</div>' +
+    '<div id="bceModalBody" style="padding:18px"></div>';
+
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+}
+
+function closeBCEModal() {
+  const overlay = document.getElementById('bceModalOverlay');
+  if (overlay) overlay.remove();
+}
+
+function renderBCEModalLoading() {
+  const body = document.getElementById('bceModalBody');
+  if (!body) return;
+  body.innerHTML = '<div style="text-align:center;padding:30px 0;color:var(--muted);font-size:13px">⏳ Interrogation de la BCE en cours...</div>';
+}
+
+function renderBCEModalError(msg) {
+  const body = document.getElementById('bceModalBody');
+  if (!body) return;
+  body.innerHTML =
+    '<div style="background:var(--red-lt);border:1px solid var(--red-bd);color:var(--red);padding:12px 14px;border-radius:8px;font-size:13px;font-weight:600;margin-bottom:14px">🚫 ' + msg + '</div>' +
+    '<div style="text-align:right"><button onclick="closeBCEModal()" style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:7px 14px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit">Fermer</button></div>';
+}
+
+function renderBCEModalResult(data) {
+  const body = document.getElementById('bceModalBody');
+  if (!body) return;
+
+  const societeContrat = D.societe?.v || '—';
+  const adresseContrat = D.adresse_facturation?.v || '—';
+  const societeBce = data.denomination || '—';
+  const adresseBce = data.adresse || '—';
+  const formeBce = data.formeJuridique || '—';
+
+  window._bceLastResult = { societe: societeBce, adresse: adresseBce };
+
+  const compRow = function(label, contratVal, bceVal, strict) {
+    const match = strict ? (String(contratVal).trim().toLowerCase() === String(bceVal).trim().toLowerCase()) : null;
+    const bceColor = strict ? (match ? 'var(--green)' : 'var(--red)') : 'var(--text)';
+    const bceIcon = strict ? (match ? '✓ ' : '⚠ ') : '';
+    return '<tr>' +
+      '<td style="padding:7px 10px;font-size:11px;font-weight:700;text-transform:uppercase;color:var(--muted);width:26%">' + label + '</td>' +
+      '<td style="padding:7px 10px;font-size:13px;color:var(--text);width:37%">' + contratVal + '</td>' +
+      '<td style="padding:7px 10px;font-size:13px;font-weight:600;color:' + bceColor + ';width:37%">' + bceIcon + bceVal + '</td>' +
+      '</tr>';
+  };
+
+  body.innerHTML =
+    '<table style="width:100%;border-collapse:collapse;margin-bottom:14px">' +
+      '<tr style="background:var(--surface)">' +
+        '<th style="padding:7px 10px;font-size:10px;font-weight:700;text-transform:uppercase;color:var(--muted);text-align:left">Champ</th>' +
+        '<th style="padding:7px 10px;font-size:10px;font-weight:700;text-transform:uppercase;color:var(--muted);text-align:left">Contrat</th>' +
+        '<th style="padding:7px 10px;font-size:10px;font-weight:700;text-transform:uppercase;color:#1D4ED8;text-align:left">BCE</th>' +
+      '</tr>' +
+      compRow('Société', societeContrat, societeBce, true) +
+      compRow('Forme juridique', '—', formeBce, false) +
+      compRow('Adresse facturation', adresseContrat, adresseBce, false) +
+    '</table>' +
+    '<div style="font-size:11px;color:var(--muted);margin-bottom:14px">La forme juridique et l\'adresse sont informatives — compare-les visuellement (formats différents possibles).</div>' +
+    '<div style="display:flex;justify-content:flex-end;gap:8px">' +
+      '<button onclick="closeBCEModal()" style="background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px 16px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit">Fermer</button>' +
+      '<button onclick="applyBCEUpdate()" style="background:var(--blue);color:#fff;border:none;border-radius:6px;padding:8px 16px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit">✓ Mettre à jour</button>' +
+    '</div>';
+}
+
+function applyBCEUpdate() {
+  const payload = window._bceLastResult;
+  if (!payload) { closeBCEModal(); return; }
+
+  if (payload.societe && payload.societe !== '—') {
+    const inpSoc = document.getElementById('edit_societe');
+    if (inpSoc) { inpSoc.value = payload.societe; validateEdit('societe'); }
+  }
+  if (payload.adresse && payload.adresse !== '—') {
+    const inpAdr = document.getElementById('edit_adresse_facturation');
+    if (inpAdr) { inpAdr.value = payload.adresse; validateEdit('adresse_facturation'); }
+  }
+  closeBCEModal();
 }
 
 function toggleSvc(key) {
@@ -1593,45 +1903,39 @@ function toggleSvc(key) {
 
 function refreshAnomalies() {
   ANOMALIES = detectAnomalies(D);
-  const redCount = ANOMALIES.filter(a=>a.sev==='red').length;
-  const orangeCount = ANOMALIES.filter(a=>a.sev==='orange').length;
-  const contractAnom = ANOMALIES.filter(a=>a.sev==='red'||a.sev==='orange');
+  const blockItems = ANOMALIES.filter(a=>a.sev==='block');
+  const adminItems = ANOMALIES.filter(a=>a.sev==='admin');
   const actionItems = ANOMALIES.filter(a=>a.sev==='action');
 
-  const anomHtml = contractAnom.length===0
-    ? '<div style="padding:8px;font-size:13px;color:var(--green);font-weight:600">✅ Aucune anomalie sur le contrat.</div>'
-    : contractAnom.map(a=>
-        '<div style="display:flex;gap:8px;padding:8px 10px;border-radius:6px;margin-bottom:5px;background:'+(a.sev==='red'?'var(--red-lt)':'var(--orange-lt)')+';border-left:3px solid '+(a.sev==='red'?'var(--red)':'var(--orange)')+'">'+
-        '<span>'+(a.sev==='red'?'🚫':'⚠️')+'</span>'+
-        '<div><div style="font-size:12px;font-weight:700;color:'+(a.sev==='red'?'var(--red)':'var(--orange)')+'">'+a.title+'</div>'+
-        '<div style="font-size:11px;color:var(--muted)">'+a.desc+'</div></div></div>'
-      ).join('');
-
-  const actionHtml = actionItems.map(a=>
-    '<div style="display:flex;gap:8px;padding:8px 10px;border-radius:6px;margin-bottom:5px;background:#EFF6FF;border-left:3px solid #3B82F6">'+
-    '<span>📋</span>'+
-    '<div><div style="font-size:12px;font-weight:700;color:#1D4ED8">'+a.title+'</div>'+
+  const makeHtml = (items, bg, border, color, icon) => items.map(a=>
+    '<div style="display:flex;gap:8px;padding:8px 10px;border-radius:6px;margin-bottom:5px;background:'+bg+';border-left:3px solid '+border+'">'+
+    '<span>'+icon+'</span>'+
+    '<div><div style="font-size:12px;font-weight:700;color:'+color+'">'+a.title+'</div>'+
     '<div style="font-size:11px;color:var(--muted)">'+a.desc+'</div></div></div>'
   ).join('');
 
   const anomBox = document.getElementById('anomaliesBox');
-  if (anomBox) anomBox.innerHTML = anomHtml;
+  if (anomBox) anomBox.innerHTML = blockItems.length===0
+    ? '<div style="padding:8px;font-size:13px;color:var(--green);font-weight:600">✅ Aucun point bloquant.</div>'
+    : makeHtml(blockItems,'var(--red-lt)','var(--red)','var(--red)','🚫');
+
+  const adminBox = document.getElementById('adminBox');
+  if (adminBox) adminBox.innerHTML = makeHtml(adminItems,'#F3F0FF','#7C3AED','#7C3AED','🔧');
+
   const actionsBox = document.getElementById('actionsBox');
-  if (actionsBox) actionsBox.innerHTML = actionHtml;
+  if (actionsBox) actionsBox.innerHTML = makeHtml(actionItems,'#EFF6FF','#3B82F6','#1D4ED8','📋');
+
   const head = document.getElementById('anomaliesHead');
   if (head) {
-    head.style.background = contractAnom.length?'var(--orange)':'';
-    head.style.color = contractAnom.length?'#fff':'';
-    head.textContent = contractAnom.length?'⚠️ Anomalies à corriger sur le contrat':'✅ Aucune anomalie sur le contrat';
+    head.style.background = blockItems.length?'var(--red)':'var(--green)';
+    head.style.color = '#fff';
+    head.textContent = blockItems.length
+      ? '🚫 '+blockItems.length+' point'+(blockItems.length>1?'s':'')+' bloquant'+(blockItems.length>1?'s':'')+' — Retour commercial requis'
+      : '✅ Aucun point bloquant';
   }
-  const ctr = document.getElementById('anomCounters');
-  if (ctr) {
-    ctr.innerHTML =
-      (redCount>0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:var(--red-lt);color:var(--red);border:1px solid var(--red-bd)">🚫 '+redCount+' bloquant'+(redCount>1?'s':'')+'</div>':'')+
-      (orangeCount>0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:var(--orange-lt);color:var(--orange);border:1px solid var(--orange-bd)">⚠️ '+orangeCount+' à vérifier</div>':'')+
-      (actionItems.length>0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:#EFF6FF;color:#1D4ED8;border:1px solid #BFDBFE">📋 '+actionItems.length+' action'+(actionItems.length>1?'s':'')+' à confirmer</div>':'')+
-      (redCount===0&&orangeCount===0?'<div style="padding:4px 10px;border-radius:99px;font-size:12px;font-weight:700;background:var(--green-lt);color:var(--green);border:1px solid var(--green-bd)">✅ Conforme</div>':'');
-  }
+
+  // Note : #anomCounters affiche désormais le type de contrat (MarketPay/Worldline),
+  // fixe pour la session — il n'est plus recalculé ici.
 }
 
 function markEditKey(inp) {
@@ -3097,12 +3401,23 @@ function buildRecap() {
   const sc=hasR?'r':hasO?'o':'g';
   const st=hasR?'Retour commercial obligatoire — dossier bloqué':hasO?'Modifications administratives nécessaires':'Dossier conforme — installation possible';
 
+  // Valeur brute IA (avant toute modification, jamais réécrite)
+  const raw = (key) => {
+    const snap = window.D_RAW;
+    if (snap && snap[key] !== undefined) {
+      const r = snap[key];
+      const v = (r && typeof r === 'object' && 'v' in r) ? r.v : r;
+      if (v !== undefined && v !== null && String(v).trim() !== '') return String(v);
+    }
+    return '--';
+  };
+
   // Valeur originale du contrat (snapshot pris au démarrage de l'appel)
   const orig = (key) => {
     const snap = window.D_ORIG;
     if(snap && snap[key] !== undefined && snap[key] !== null && snap[key] !== '') return String(snap[key]);
-    const v = D[key]?.v;
-    return (v !== undefined && v !== null && v !== '') ? String(v) : '--';
+    // Filet de sécurité : D_RAW (jamais modifié) plutôt que D (mutable, déjà à jour ici)
+    return raw(key);
   };
 
   // Valeur actuelle après modifications dans la trame
@@ -3116,10 +3431,11 @@ function buildRecap() {
     const o = orig(key);
     const c = current(key);
     const changed = c !== o && c !== '--';
+    const oDisplay = o === '--' ? '—' : o;
     return '<tr>'+
       '<td style="padding:7px 10px;font-size:11px;font-weight:700;text-transform:uppercase;color:var(--muted);width:28%">'+label+'</td>'+
-      '<td style="padding:7px 10px;font-size:13px;'+(changed?'color:var(--red);':'color:var(--text);')+'width:36%">'+o+'</td>'+
-      '<td style="padding:7px 10px;font-size:13px;'+(changed?'color:#3B5BDB;font-weight:700;':'color:var(--muted);')+'width:36%">'+(changed?c:'—')+'</td>'+
+      '<td style="padding:7px 10px;font-size:13px;'+(changed?'color:var(--red);':'color:var(--text);')+'width:36%">'+oDisplay+'</td>'+
+      '<td style="padding:7px 10px;font-size:13px;'+(changed?'color:var(--green);font-weight:700;':'color:var(--muted);')+'width:36%">'+(changed?'✓ '+c:'—')+'</td>'+
     '</tr>';
   };
 
@@ -3157,24 +3473,33 @@ function buildRecap() {
     '</tr>';
   }).join('');
 
-  // Modifications pendant l'appel
-  const modifActions = ACTIONS.filter(function(a){ return a.t==='o' || a.t==='r'; });
-  const actHTML = ACTIONS.length
-    ? ACTIONS.map(function(a){
+  // Modification à faire sur le contrat — actions réelles (hors simples confirmations sans changement)
+  // + anomalies "admin" (corrections à effectuer) fusionnées dans la même liste.
+  const realActions = ACTIONS.filter(function(a){ return !a.msg.startsWith('Confirmé : '); });
+  const adminAnomalies = ANOMALIES.filter(function(a){ return a.sev==='admin'; });
+  const blockAnomalies = ANOMALIES.filter(function(a){ return a.sev==='block'; });
+
+  const actHTML = (realActions.length || adminAnomalies.length)
+    ? realActions.map(function(a){
+        const isCritical = a.t==='r';
         return '<div style="padding:7px 10px;border-radius:6px;font-size:12px;font-weight:600;margin-bottom:5px;border-left:3px solid;'+
-          'background:'+(a.t==='r'?'var(--red-lt)':a.t==='o'?'var(--orange-lt)':'var(--green-lt)')+';'+
-          'border-color:'+(a.t==='r'?'var(--red)':a.t==='o'?'var(--orange)':'var(--green)')+';'+
-          'color:'+(a.t==='r'?'#7f1d1d':a.t==='o'?'#78350f':'#14532d')+'">'+
-          (a.t==='r'?'🚫':a.t==='o'?'🔧':'✅')+' '+a.msg+'</div>';
+          'background:'+(isCritical?'var(--red-lt)':'#EFF6FF')+';'+
+          'border-color:'+(isCritical?'var(--red)':'#3B82F6')+';'+
+          'color:'+(isCritical?'#7f1d1d':'#1D4ED8')+'">'+
+          (isCritical?'🚫':'🔧')+' '+a.msg+'</div>';
+      }).join('') +
+      adminAnomalies.map(function(a){
+        return '<div style="padding:7px 10px;border-radius:6px;font-size:12px;font-weight:600;margin-bottom:5px;border-left:3px solid;'+
+          'background:#EFF6FF;border-color:#3B82F6;color:#1D4ED8">🔧 '+a.title+' — '+a.desc+'</div>';
       }).join('')
     : '<div style="color:var(--green);font-size:13px;font-weight:600">✅ Aucune action requise</div>';
 
-  // Anomalies (sans les green)
-  const anomaliesOnly = ANOMALIES.filter(function(a){ return a.sev!=='green'; });
+  // Anomalies bloquantes uniquement (les corrections admin sont désormais dans "Modification à faire sur le contrat")
+  const anomaliesOnly = blockAnomalies;
   const docsConformes = ANOMALIES.filter(function(a){ return a.sev==='green'; });
 
   const anomalyRows = anomaliesOnly.map(function(a){
-    return '<tr><td style="color:'+(a.sev==='red'?'var(--red)':'var(--orange)')+';font-weight:700;width:40%">'+(a.sev==='red'?'🚫':'⚠️')+' '+a.title+'</td><td style="font-size:12px">'+a.desc+'</td></tr>';
+    return '<tr><td style="color:var(--red);font-weight:700;width:40%">🚫 '+a.title+'</td><td style="font-size:12px">'+a.desc+'</td></tr>';
   }).join('');
 
   const docRows = docsConformes.map(function(a){
@@ -3191,16 +3516,18 @@ function buildRecap() {
     '</tr>';
 
   // Ligne terminal modèle
+  const modeleOrigDisplay = (modModif?modModif.split('→')[0].trim():modeleOrig);
   const modeleRow = '<tr>'+
     '<td style="padding:7px 10px;font-size:11px;font-weight:700;text-transform:uppercase;color:var(--muted)">Modèle</td>'+
-    '<td style="padding:7px 10px;font-size:13px;'+(modeleChanged?'color:var(--red);':'')+'">'+(modModif?modModif.split('→')[0].trim():modeleOrig)+'</td>'+
-    '<td style="padding:7px 10px;font-size:13px;'+(modeleChanged?'color:#3B5BDB;font-weight:700;':'color:var(--muted);')+'">'+(modeleChanged?modeleAfter:'—')+'</td>'+
+    '<td style="padding:7px 10px;font-size:13px;'+(modeleChanged?'color:var(--red);':'')+'">'+(modeleOrigDisplay==='--'?'—':modeleOrigDisplay)+'</td>'+
+    '<td style="padding:7px 10px;font-size:13px;'+(modeleChanged?'color:var(--green);font-weight:700;':'color:var(--muted);')+'">'+(modeleChanged?'✓ '+modeleAfter:'—')+'</td>'+
   '</tr>';
 
+  const conOrigDisplay = conOrig === '--' ? '—' : conOrig;
   const conRow = '<tr>'+
     '<td style="padding:7px 10px;font-size:11px;font-weight:700;text-transform:uppercase;color:var(--muted)">Connectivité</td>'+
-    '<td style="padding:7px 10px;font-size:13px;'+(conChanged?'color:var(--red);':'')+'">'+conOrig+'</td>'+
-    '<td style="padding:7px 10px;font-size:13px;'+(conChanged?'color:#3B5BDB;font-weight:700;':'color:var(--muted);')+'">'+(conChanged?(splitConModif||conAfter||'—'):'—')+'</td>'+
+    '<td style="padding:7px 10px;font-size:13px;'+(conChanged?'color:var(--red);':'')+'">'+conOrigDisplay+'</td>'+
+    '<td style="padding:7px 10px;font-size:13px;'+(conChanged?'color:var(--green);font-weight:700;':'color:var(--muted);')+'">'+(conChanged?'✓ '+(splitConModif||conAfter||conOrig):'—')+'</td>'+
   '</tr>';
 
   document.getElementById('recapContent').innerHTML =
@@ -3243,7 +3570,7 @@ function buildRecap() {
 
     // ACTIONS À RÉALISER
     '<div class="section-card" style="margin-bottom:12px">'+
-      '<div class="sc-head">Actions à réaliser</div>'+
+      '<div class="sc-head">Modification à faire sur le contrat</div>'+
       '<div style="padding:12px">'+actHTML+'</div></div>'+
 
     // ANOMALIES (sans docs)
@@ -3271,8 +3598,12 @@ function goNext() {
   if (phase===0) {
     // Analyse → Email
     phase=1;
-    window.D_ORIG = {};
-    Object.keys(D).forEach(function(k){ window.D_ORIG[k] = D[k] && D[k].v !== undefined ? String(D[k].v) : D[k]; });
+    // Uniquement la première fois : un retour puis un nouveau passage ne doit pas
+    // réinitialiser la référence d'origine avec l'état déjà modifié.
+    if (!window.D_ORIG || Object.keys(window.D_ORIG).length === 0) {
+      window.D_ORIG = {};
+      Object.keys(D).forEach(function(k){ window.D_ORIG[k] = D[k] && D[k].v !== undefined ? String(D[k].v) : D[k]; });
+    }
     document.getElementById('step1').style.display='none';
     const s2=document.getElementById('step2');
     s2.style.display='flex';
@@ -3434,9 +3765,9 @@ function showDuplicatePopup(type, soc, bce, dateSig, source) {
 // ============================================================
 async function saveAnalysisToKV(source) {
   try {
-    const redCount = ANOMALIES.filter(a=>a.sev==='red').length;
-    const orangeCount = ANOMALIES.filter(a=>a.sev==='orange').length;
-    const statut = redCount > 0 ? 'bloquant' : orangeCount > 0 ? 'a_corriger' : 'conforme';
+    const blockCount = ANOMALIES.filter(a=>a.sev==='block').length;
+    const adminCount = ANOMALIES.filter(a=>a.sev==='admin').length;
+    const statut = blockCount > 0 ? 'bloquant' : adminCount > 0 ? 'a_corriger' : 'conforme';
     const payload = {
       source: source || 'email',
       commercial: D.commercial?.v || '',
@@ -3446,11 +3777,12 @@ async function saveAnalysisToKV(source) {
       modele: D.modele?.v || '',
       location_type: D.location_type?.v || '',
       duree_mois: D.duree_mois?.v || '',
-      anomalies: ANOMALIES.filter(a=>a.sev==='red'||a.sev==='orange').map(a=>({sev:a.sev,title:a.title,desc:a.desc})),
+      anomalies: ANOMALIES.filter(a=>a.sev==='block'||a.sev==='admin').map(a=>({sev:a.sev,title:a.title,desc:a.desc})),
       actions: ANOMALIES.filter(a=>a.sev==='action').map(a=>({title:a.title})),
       statut,
-      nb_red: redCount,
-      nb_orange: orangeCount,
+      // Noms de champs conservés (nb_red/nb_orange) pour ne rien casser côté dashboard/Worker.
+      nb_red: blockCount,
+      nb_orange: adminCount,
     };
     const resp = await fetch('https://quiet-bonus-454e.olivierdubost.workers.dev/save-analysis', {
       method: 'POST',
@@ -3504,7 +3836,7 @@ function genPDF() {
 
   sec('TERMINAL & CONTRAT');
   row('Modele',g('modele'));row('Connectivite',g('connect'));row('Nb terminaux',g('nb'));
-  row('Kit',g('kit'));row('Caisse',g('caisse'));
+  row('Assistance technique',g('kit'));row('Caisse',g('caisse'));
   row('Acquisition',g('location_type')+(D.loyer_ttc?.v?' — '+D.loyer_ttc.v+' € TTC':'')+' '+(D.duree_mois?.v?'('+D.duree_mois.v+' mois)':''));
   y+=3;
 
@@ -3513,9 +3845,10 @@ function genPDF() {
   Object.entries(svcL).forEach(([k,l])=>row(l,D[k]==='oui'?'Oui':D[k]==='non'?'Non':'--'));
   y+=3;
 
-  if(ANOMALIES.length){
+  const contractAnomPDF = ANOMALIES.filter(a=>a.sev==='block'||a.sev==='admin');
+  if(contractAnomPDF.length){
     sec('ANOMALIES DETECTEES',[220,38,38]);
-    ANOMALIES.forEach(a=>row((a.sev==='red'?'BLOQUANT: ':'ATTENTION: ')+a.title,a.desc,a.sev==='orange'));
+    contractAnomPDF.forEach(a=>row((a.sev==='block'?'BLOQUANT: ':'ATTENTION: ')+a.title,a.desc,a.sev==='admin'));
     y+=3;
   }
 
@@ -3574,7 +3907,7 @@ var T = {
     s1_confirm: 'Ces informations sont-elles correctes\u00a0?',
     s2_title: '2. Confirmation du mat\u00e9riel command\u00e9',
     s2_note: 'Selon votre contrat, vous avez command\u00e9\u00a0:',
-    s2_qty: 'Quantit\u00e9', s2_model: 'Mod\u00e8le', s2_desc: 'Description', s2_connect: 'Connectivit\u00e9 disponible', s2_kit: 'Kit', s2_abo: 'Abonnement',
+    s2_qty: 'Quantit\u00e9', s2_model: 'Mod\u00e8le', s2_desc: 'Description', s2_connect: 'Connectivit\u00e9 disponible', s2_kit: 'Assistance technique', s2_abo: 'Abonnement',
     s2_confirm: 'Ces informations vous semblent-elles correctes\u00a0?',
     s3_title: '3. Questions compl\u00e9mentaires',
     s4_title: '4. Confirmation des services',
@@ -3627,7 +3960,7 @@ var T = {
     s1_confirm: 'Zijn deze gegevens correct\u00a0?',
     s2_title: '2. Bevestiging van het bestelde materiaal',
     s2_note: 'Volgens uw contract hebt u besteld\u00a0:',
-    s2_qty: 'Aantal', s2_model: 'Model', s2_desc: 'Omschrijving', s2_connect: 'Beschikbare connectiviteit', s2_kit: 'Kit', s2_abo: 'Abonnement',
+    s2_qty: 'Aantal', s2_model: 'Model', s2_desc: 'Omschrijving', s2_connect: 'Beschikbare connectiviteit', s2_kit: 'Assistance technique', s2_abo: 'Abonnement',
     s2_confirm: 'Ziet u deze informatie correct\u00a0?',
     s3_title: '3. Aanvullende vragen',
     s4_title: '4. Bevestiging van de diensten',
